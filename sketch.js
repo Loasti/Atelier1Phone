@@ -4,4 +4,8 @@ function setup() {
 
 function draw() {
   background(237, 34, 93);
+
 }
+
+console.log("Changes made");
+
