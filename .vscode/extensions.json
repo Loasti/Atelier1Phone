@@ -1,0 +1,7 @@
+{
+  // VS Code offers to install these when you open this folder.
+  "recommendations": [
+    "Irti.p5js-project-generator",
+    "ritwickdey.LiveServer"
+  ]
+}
