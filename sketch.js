@@ -2,8 +2,8 @@ const SCALE = 400;
 const MAX_ACCEL = 8;
 const MAX_SPEED = 3000;
 const SMOOTH_TAU = 0.06;
-const REST_ACCEL = 0.25;
-const BASELINE_TAU = 0.5;
+const REST_ACCEL = 0.6;
+const ARM_TIME = 0.5;
 
 let kingdom;
 let zoom = 1;
@@ -11,7 +11,9 @@ let panX = 0;
 let panMax = 0;
 let speed = 0;
 let baseline = 0;
-let baselineReady = false;
+let armLeft = ARM_TIME;
+let armSum = 0;
+let armN = 0;
 let lastTime = 0;
 
 async function setup() {
@@ -40,9 +42,13 @@ function layout() {
 function advancePan(dt) {
   const raw = accelerationX || 0;
 
-  if (!baselineReady) {
-    baseline = raw;
-    baselineReady = true;
+  if (armLeft > 0) {
+    armSum += raw;
+    armN++;
+    armLeft -= dt;
+    speed = 0;
+    if (armLeft <= 0 && armN > 0) baseline = armSum / armN;
+    return;
   }
 
   const a = constrain(raw - baseline, -MAX_ACCEL, MAX_ACCEL);
@@ -50,10 +56,6 @@ function advancePan(dt) {
 
   speed = lerp(speed, target, constrain(dt / (SMOOTH_TAU + dt), 0, 1));
   panX = constrain(panX + speed * dt, 0, panMax);
-
-  if (abs(a) < REST_ACCEL) {
-    baseline = lerp(baseline, raw, constrain(dt / BASELINE_TAU, 0, 1));
-  }
 }
 
 function draw() {
@@ -97,8 +99,9 @@ function windowResized() {
 
 function mousePressed() {
   if (window.sensorsEnabled) {
-    baseline = accelerationX || 0;
-    baselineReady = true;
+    armLeft = ARM_TIME;
+    armSum = 0;
+    armN = 0;
     speed = 0;
   }
   return false;
