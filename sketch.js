@@ -1,7 +1,7 @@
 const SCALE = 2500;
 const MAX_ACCEL = 8;
 const MAX_SPEED = 3000;
-const SMOOTH = 0.05;
+const SMOOTH_TAU = 0.05;
 const FRICTION_TAU = 25;
 const DEADBAND = 120;
 const REST_ACCEL = 0.25;
@@ -52,7 +52,7 @@ function advancePan(dt) {
   const a = constrain(raw - baseline, -MAX_ACCEL, MAX_ACCEL);
   const quiet = abs(a) < REST_ACCEL;
 
-  smoothed = lerp(smoothed, a, dt / (SMOOTH + dt));
+  smoothed = lerp(smoothed, a, dt / (SMOOTH_TAU + dt));
 
   vel += smoothed * SCALE * dt;
   vel *= Math.exp(-dt / FRICTION_TAU);
@@ -82,7 +82,7 @@ function draw() {
   lastTime = now;
 
   if (window.sensorsEnabled && dt > 0) {
-    step(dt);
+    advancePan(dt);
   }
 
   const srcW = width / zoom;
