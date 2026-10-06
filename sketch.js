@@ -1,18 +1,15 @@
-const SCALE = 2500;
+const SCALE = 400;
 const MAX_ACCEL = 8;
 const MAX_SPEED = 3000;
-const SMOOTH_TAU = 0.05;
-const FRICTION_TAU = 25;
-const DEADBAND = 120;
+const SMOOTH_TAU = 0.06;
 const REST_ACCEL = 0.25;
-const BASELINE_TAU = 0.3;
+const BASELINE_TAU = 0.5;
 
 let kingdom;
 let zoom = 1;
 let panX = 0;
 let panMax = 0;
-let vel = 0;
-let smoothed = 0;
+let speed = 0;
 let baseline = 0;
 let baselineReady = false;
 let lastTime = 0;
@@ -45,25 +42,18 @@ function advancePan(dt) {
 
   if (!baselineReady) {
     baseline = raw;
-    smoothed = 0;
     baselineReady = true;
   }
 
   const a = constrain(raw - baseline, -MAX_ACCEL, MAX_ACCEL);
-  const quiet = abs(a) < REST_ACCEL;
+  const target = abs(a) < REST_ACCEL ? 0 : SCALE * a;
 
-  smoothed = lerp(smoothed, a, dt / (SMOOTH_TAU + dt));
+  speed = lerp(speed, target, constrain(dt / (SMOOTH_TAU + dt), 0, 1));
+  panX = constrain(panX + speed * dt, 0, panMax);
 
-  vel += smoothed * SCALE * dt;
-  vel *= Math.exp(-dt / FRICTION_TAU);
-  vel = constrain(vel, -MAX_SPEED, MAX_SPEED);
-
-  if (quiet) {
+  if (abs(a) < REST_ACCEL) {
     baseline = lerp(baseline, raw, constrain(dt / BASELINE_TAU, 0, 1));
-    if (abs(vel) < DEADBAND) vel = 0;
   }
-
-  panX = constrain(panX + vel * dt, 0, panMax);
 }
 
 function draw() {
@@ -109,8 +99,7 @@ function mousePressed() {
   if (window.sensorsEnabled) {
     baseline = accelerationX || 0;
     baselineReady = true;
-    smoothed = 0;
-    vel = 0;
+    speed = 0;
   }
   return false;
 }
