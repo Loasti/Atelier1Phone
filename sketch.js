@@ -40,7 +40,7 @@ function layout() {
   panX = constrain(panX, 0, panMax);
 }
 
-function step(dt) {
+function advancePan(dt) {
   const raw = accelerationX || 0;
 
   if (!baselineReady) {
