@@ -121,6 +121,14 @@ let pauseDay = 0;
 let localReady = false;
 let showField = false;
 
+// Click-to-examine: a temporary screen-space copy floats to the centre with a
+// stats card. The original Otto is never modified.
+let examineRef = null;
+let examineSnapshot = null;
+let examineClone = null;
+let examineT = 0; // 0 = at the Otto, 1 = floating at centre
+let examineLeaving = false;
+
 async function setup() {
   createCanvas(windowWidth, windowHeight);
   pixelDensity(min(2, displayDensity()));
@@ -200,6 +208,11 @@ function resetTracking() {
   paused = false;
   pauseDay = 0;
   localReady = false;
+  examineRef = null;
+  examineSnapshot = null;
+  examineClone = null;
+  examineT = 0;
+  examineLeaving = false;
 }
 
 function defaultStats() {
@@ -261,6 +274,150 @@ function maxOttoSize() {
   return m;
 }
 
+// --------------------------------------------------------------- examine view
+
+function ottoHit(o, x, y) {
+  const p = fieldToScreen(o.pos.x, o.pos.y);
+  const h = OTTO_UNITS_TALL * o.stats.size * field.px;
+  const cy = p.y - h * 0.5;
+  const r = Math.max(20, h * 0.5);
+  return Math.hypot(x - p.x, y - cy) < r;
+}
+
+function startExamine(o) {
+  examineRef = o;
+  examineSnapshot = {
+    id: o.id,
+    stats: { ...o.stats },
+    hp: o.hp,
+    energy: o.energy,
+    color: colonyColorFor(window.shareClientId),
+  };
+  const p = fieldToScreen(o.pos.x, o.pos.y);
+  const targetHeight = Math.min(height * 0.34, width * 0.55);
+  const targetSize = Math.max(0.4, targetHeight / (OTTO_UNITS_TALL * Math.max(1, field.px)));
+  examineClone = {
+    x: p.x,
+    y: p.y,
+    size: o.stats.size,
+    startX: p.x,
+    startY: p.y,
+    startSize: o.stats.size,
+    targetX: width * 0.58,
+    targetY: height * 0.5,
+    targetSize,
+    facing: o.facing,
+    color: colonyColorFor(window.shareClientId),
+  };
+  examineT = 0;
+  examineLeaving = false;
+}
+
+function dismissExamine() {
+  if (!examineClone) return;
+  examineLeaving = true;
+}
+
+function updateExamine(dt) {
+  if (!examineClone) return;
+
+  const speed = examineLeaving ? 8 : 4;
+  examineT = examineT + (examineLeaving ? -1 : 1) * dt * speed;
+  examineT = constrain(examineT, 0, 1);
+
+  if (examineLeaving && examineT <= 0.001) {
+    examineClone = null;
+    examineRef = null;
+    examineSnapshot = null;
+    examineLeaving = false;
+    return;
+  }
+
+  const t = examineT * examineT * (3 - 2 * examineT); // smoothstep
+  examineClone.x = lerp(examineClone.startX, examineClone.targetX, t);
+  examineClone.y = lerp(examineClone.startY, examineClone.targetY, t);
+  examineClone.size = lerp(examineClone.startSize, examineClone.targetSize, t);
+}
+
+function drawExamineClone() {
+  if (!examineClone) return;
+  const c = examineClone;
+  drawOttoAt(c.x, c.y, c.size, 1, c.facing, 0, 1, c.color);
+}
+
+function drawStatsCard() {
+  if (!examineClone || examineT < 0.15) return;
+  const ref = examineRef;
+  const snap = examineSnapshot;
+  if (!snap) return;
+
+  const st = ref && !ref.dead ? ref.stats : snap.stats;
+  const hp = ref && !ref.dead ? ref.hp : snap.hp;
+  const energy = ref && !ref.dead ? ref.energy : snap.energy;
+  const id = snap.id;
+  const need = energyRequirementFor(st.size);
+
+  const s = constrain(width * 0.031, 10, 16);
+  const cardW = s * 15.5;
+  const cardH = s * 11;
+  let cardX = examineClone.x - cardW - s * 3;
+  let cardY = examineClone.y - cardH * 0.55;
+  cardX = constrain(cardX, 12, width - cardW - 12);
+  cardY = constrain(cardY, 12, height - cardH - 12);
+
+  push();
+
+  // Leader line from the card to the floating copy.
+  stroke(126, 255, 190, 120);
+  strokeWeight(1);
+  drawingContext.setLineDash([5, 4]);
+  line(cardX + cardW, cardY + cardH * 0.5, examineClone.x, examineClone.y);
+  drawingContext.setLineDash([]);
+
+  noStroke();
+  fill(4, 10, 16, 220);
+  rect(cardX, cardY, cardW, cardH, 10);
+  stroke(126, 255, 190, 120);
+  strokeWeight(1);
+  noFill();
+  rect(cardX, cardY, cardW, cardH, 10);
+  noStroke();
+
+  textAlign(LEFT, TOP);
+  fill(240, 252, 255, 235);
+  textSize(s * 0.8);
+  text(`OTTO ${id}`, cardX + 10, cardY + 7);
+
+  const rows = [
+    ['ATTACK', st.attack],
+    ['SPEED', st.speed.toFixed(1)],
+    ['SIZE', st.size.toFixed(2)],
+    ['SIGHT', st.sight.toFixed(0)],
+    ['AGGRESSION', st.aggression],
+    ['ENERGY/DAY', need],
+    ['HP', `${Math.max(0, Math.round(hp))}/${MAX_HP}`],
+    ['ENERGY', Math.round(energy)],
+  ];
+
+  textSize(s * 0.62);
+  for (let i = 0; i < rows.length; i++) {
+    const y = cardY + 7 + s * 1.5 + i * s * 1.0;
+    fill(150, 200, 225, 190);
+    textAlign(LEFT, TOP);
+    text(rows[i][0], cardX + 10, y);
+    fill(240, 252, 255, 220);
+    textAlign(RIGHT, TOP);
+    text(String(rows[i][1]), cardX + cardW - 10, y);
+  }
+
+  fill(140, 190, 215, 150);
+  textAlign(CENTER, TOP);
+  textSize(s * 0.55);
+  text('CLICK TO CLOSE', cardX + cardW / 2, cardY + cardH - s * 1.4);
+
+  pop();
+}
+
 function draw() {
   const now = millis() / 1000;
   const dt = constrain(now - lastMillis, 0, 0.1);
@@ -287,7 +444,7 @@ function draw() {
 
   updateField(dt);
   updateRemote(dt);
-  updateFood(dt);
+  updateExamine(dt);
 
   if (marker.found && !fieldEntered) enterField();
 
@@ -307,6 +464,8 @@ function draw() {
   drawColonyRings();
   drawRemoteOttos();
   drawLocalOttos();
+  drawExamineClone();
+  drawStatsCard();
   drawHud();
   if (panel.open) drawPanel();
   drawPauseOverlay();
@@ -1262,6 +1421,7 @@ function drawColonyRing(ctx, cx, groundY, w, h, alpha, color) {
 // rather than a nearer Otto's ring crossing an overlapping neighbour.
 function drawColonyRings() {
   if (!field.ok || !ottoGif || fieldLock < 0.01) return;
+  if (examineT > 0.15) return;
 
   const ctx = drawingContext;
   const localColor = colonyColorFor(window.shareClientId);
@@ -1292,9 +1452,11 @@ function drawColonyRings() {
 function drawLocalOttos() {
   if (!ottoGif || !field.ok || fieldLock < 0.01) return;
   const color = colonyColorFor(window.shareClientId);
+  const sceneAlpha = 1 - examineT * 0.75;
   for (const o of ottos) {
+    if (o === examineRef) continue;
     const fade = o.dead ? Math.max(0, 1 - o.death / DEATH_LINGER) : 1;
-    const alpha = fieldLock * o.spawn * fade;
+    const alpha = fieldLock * o.spawn * fade * sceneAlpha;
     if (alpha < 0.01) continue;
     const p = fieldToScreen(o.pos.x, o.pos.y);
     drawOttoAt(
@@ -1312,11 +1474,12 @@ function drawLocalOttos() {
 
 function drawRemoteOttos() {
   if (!field.ok || !ottoGif) return;
+  const sceneAlpha = 1 - examineT * 0.75;
   for (const r of remote.values()) {
     if (r.lock <= 0.01) continue;
     const fade =
       r.hp <= 0 ? Math.max(0, 1 - (r.deadTime || 0) / DEATH_LINGER) : 1;
-    const alpha = r.lock * fade;
+    const alpha = r.lock * fade * sceneAlpha;
     if (alpha < 0.01) continue;
     const p = fieldToScreen(r.x, r.y);
     drawOttoAt(
@@ -1428,6 +1591,9 @@ function drawFood() {
   if (!store) return;
 
   const ctx = drawingContext;
+  const sceneAlpha = 1 - examineT * 0.75;
+  ctx.save();
+  ctx.globalAlpha = sceneAlpha;
   for (const id in store) {
     const f = store[id];
     if (!f || typeof f.x !== 'number') continue;
@@ -1447,6 +1613,7 @@ function drawFood() {
     ctx.stroke();
     ctx.restore();
   }
+  ctx.restore();
 }
 
 function drawFieldDebug() {
@@ -1572,6 +1739,26 @@ function drawHud() {
       : 'NO OTTO YET · SHOW IT A GREEN OBJECT',
     18,
     16 + s * 6.15
+  );
+
+  // Day progress timer.
+  const dayProgress = paused ? 1 : constrain(dayClock / DAY_SECONDS, 0, 1);
+  const barW = Math.min(width * 0.42, s * 18);
+  const barH = s * 0.42;
+  const barX = 18;
+  const barY = 16 + s * 7.0;
+  noStroke();
+  fill(255, 255, 255, 34);
+  rect(barX, barY, barW, barH, barH / 2);
+  fill(paused ? color(255, 200, 110, 200) : color(126, 255, 190, 200));
+  rect(barX, barY, barW * dayProgress, barH, barH / 2);
+  fill(180, 220, 240, 170);
+  textSize(s * 0.55);
+  textAlign(LEFT, CENTER);
+  text(
+    paused ? 'PAUSED' : `${Math.max(0, Math.ceil(DAY_SECONDS - dayClock))}s`,
+    barX + barW + 8,
+    barY + barH / 2 + 1
   );
 
   // Tracking and tuning, kept clear of the desktop QR in the top-right corner.
@@ -1817,6 +2004,12 @@ function hitRect(r, x, y) {
 }
 
 function mousePressed() {
+  // Any click while an Otto is being examined closes the view.
+  if (examineClone) {
+    dismissExamine();
+    return false;
+  }
+
   if (panel.open) {
     const row = panelRowAt(mouseX, mouseY);
     if (row) {
@@ -1859,6 +2052,17 @@ function mousePressed() {
       shared.pause = { active: true, day: dayNumber, votes };
     }
     return false;
+  }
+
+  // Clicking an Otto opens the examine copy and stats card.
+  if (field.ok && fieldLock > 0.05) {
+    for (const o of ottos) {
+      if (o.dead) continue;
+      if (ottoHit(o, mouseX, mouseY)) {
+        startExamine(o);
+        return false;
+      }
+    }
   }
 
   if (fieldEntered && fieldLock > 0.3) {
