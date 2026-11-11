@@ -35,7 +35,7 @@ const FOOD_AMOUNT = 10;
 const FOOD_MAX = 6;
 const FOOD_RADIUS = 0.45;
 const SPAWN_EVERY = 5;
-const DAY_SECONDS = 240; // one day: food is tallied and reproduction is checked
+const DAY_SECONDS = 60; // one day: food is tallied and reproduction is checked
 
 // An Otto burns ENERGY_PER_SIZE × its Size every day. The requirement is
 // derived from Size alone, so no editor or inheritance path can change it.
@@ -110,7 +110,15 @@ let lastMillis = 0;
 let scanTick = 0;
 let joinHit = null;
 let tuneHit = null;
+let pauseHit = null;
+let yesHit = null;
 let panel = { open: false, rows: [], drag: null, fieldHit: null };
+
+// Pause state. Solo toggles locally; multiplayer waits for every connected
+// phone to tap YES at the start of a new day.
+let paused = false;
+let pauseDay = 0;
+let localReady = false;
 let showField = false;
 
 async function setup() {
@@ -162,6 +170,15 @@ function shareReady() {
   // Keep the shared schema stable even if another client created the room.
   if (!shared.food || typeof shared.food !== 'object') shared.food = {};
   if (window.me && !Array.isArray(me.ottos)) me.ottos = [];
+  if (!shared.pause || typeof shared.pause !== 'object') {
+    shared.pause = { active: false, day: 0, votes: {} };
+  }
+  // Joining mid-pause means this phone has not voted yet.
+  if (shared.pause.active && shared.pause.day === dayNumber) {
+    paused = true;
+    pauseDay = dayNumber;
+    localReady = false;
+  }
   remote.clear();
   foodSpawnTimer = 0;
   if (shareIsHost) seedFood(shared.food, 3);
@@ -180,6 +197,9 @@ function resetTracking() {
   markerLost = 0;
   dayClock = 0;
   dayNumber = 1;
+  paused = false;
+  pauseDay = 0;
+  localReady = false;
 }
 
 function defaultStats() {
@@ -279,7 +299,8 @@ function draw() {
     if (markerLost > 0.12) fieldLock *= Math.exp(-dt / 0.18);
   }
 
-  if (fieldEntered && field.ok) updateBehaviour(dt);
+  if (!paused && fieldEntered && field.ok) updateBehaviour(dt);
+  if (!paused) updateFood(dt);
 
   drawFood();
   if (showField) drawFieldDebug();
@@ -288,6 +309,7 @@ function draw() {
   drawLocalOttos();
   drawHud();
   if (panel.open) drawPanel();
+  drawPauseOverlay();
 }
 
 // ---------------------------------------------------------------- detection
@@ -540,6 +562,15 @@ function endOfDay() {
   }
 
   dayNumber += 1;
+
+  // A new day begins paused. In solo the player can resume immediately; in a
+  // shared room everyone must tap YES before the day (and food spawning) starts.
+  paused = true;
+  pauseDay = dayNumber;
+  localReady = false;
+  if (shareConnected) {
+    shared.pause = { active: true, day: dayNumber, votes: {} };
+  }
 }
 
 // The child inherits a mutated genome but starts the new day with no food.
@@ -897,6 +928,32 @@ function updateRemote(dt) {
     }
   }
 
+  // Sync the shared pause state. Every connected phone must vote YES before a
+  // paused day (and its food spawning) can resume.
+  if (shareConnected && shared.pause && typeof shared.pause === 'object') {
+    const p = shared.pause;
+    if (p.active && p.day === dayNumber) {
+      if (!paused) {
+        paused = true;
+        pauseDay = dayNumber;
+        localReady = false;
+      }
+      const playerGuests = Array.isArray(guests)
+        ? guests.filter((g) => g && (Array.isArray(g.ottos) || g.otto))
+        : [];
+      const needed = playerGuests.length + 1;
+      const have = Object.keys(p.votes || {}).length;
+      if (have >= needed) {
+        paused = false;
+        localReady = false;
+        shared.pause = { active: false, day: dayNumber, votes: {} };
+        foodSpawnTimer = 0;
+      }
+    } else if (!p.active || p.day !== dayNumber) {
+      paused = false;
+    }
+  }
+
   for (const [id, r] of remote) {
     if (!seen.has(id)) {
       r.lock -= dt * 3;
@@ -938,6 +995,73 @@ function numberOr(v, fallback) {
 }
 
 // ------------------------------------------------------------------ drawing
+
+function drawPauseOverlay() {
+  if (!paused) {
+    yesHit = null;
+    return;
+  }
+
+  const s = constrain(width * 0.031, 10, 16);
+
+  // Keep the game visible and interactive: a small card in the top-right
+  // corner instead of a full-screen dimming overlay.
+  const cardW = s * 15;
+  const cardH = shareConnected ? s * 6.2 : s * 3.4;
+  const cardX = width - cardW - 14;
+  const cardY = 16 + s * 1.2;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 190);
+  rect(cardX, cardY, cardW, cardH, 10);
+  stroke(140, 230, 255, 90);
+  strokeWeight(1);
+  noFill();
+  rect(cardX, cardY, cardW, cardH, 10);
+  noStroke();
+
+  textAlign(LEFT, TOP);
+  fill(240, 252, 255, 235);
+  textSize(s * 0.85);
+  text(`DAY ${dayNumber} · PAUSED`, cardX + 10, cardY + 6);
+
+  if (shareConnected) {
+    const playerGuests = Array.isArray(guests)
+      ? guests.filter((g) => g && (Array.isArray(g.ottos) || g.otto))
+      : [];
+    const needed = playerGuests.length + 1;
+    const votes = (shared.pause && shared.pause.votes) || {};
+    const have = Object.keys(votes).length;
+
+    fill(180, 220, 240, 190);
+    textSize(s * 0.62);
+    text(`Waiting: ${have}/${needed}`, cardX + 10, cardY + 6 + s * 1.15);
+
+    const bw = cardW - 20;
+    const bh = s * 2.2;
+    const bx = cardX + 10;
+    const by = cardY + cardH - bh - 6;
+    yesHit = { x: bx, y: by, w: bw, h: bh };
+
+    noFill();
+    stroke(localReady ? color(126, 255, 190, 170) : color(140, 230, 255, 90));
+    strokeWeight(1);
+    rect(bx, by, bw, bh, bh / 2);
+    noStroke();
+    fill(localReady ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
+    textAlign(CENTER, CENTER);
+    textSize(s * 0.72);
+    text(localReady ? 'YES ✓' : 'YES', bx + bw / 2, by + bh / 2 + 1);
+  } else {
+    fill(180, 220, 240, 190);
+    textSize(s * 0.62);
+    text('Tap RESUME', cardX + 10, cardY + 6 + s * 1.15);
+    yesHit = null;
+  }
+
+  pop();
+}
 
 function drawWaiting(now) {
   background(5, 8, 12);
@@ -1451,6 +1575,7 @@ function drawHud() {
   );
 
   // Tracking and tuning, kept clear of the desktop QR in the top-right corner.
+  pauseHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 7.45;
   const label = found ? 'LOCKED' : 'SEEKING';
@@ -1481,6 +1606,24 @@ function drawHud() {
   textAlign(CENTER, CENTER);
   textSize(s * 0.58);
   text(panel.open ? 'CLOSE' : 'TUNE', chipX + chipW / 2, chipY + chipH / 2 + 1);
+
+  // Solo pause toggle. In a shared room the day pauses itself and players tap YES.
+  if (!shareConnected && !panel.open) {
+    const pauseLabel = paused ? 'RESUME' : 'PAUSE';
+    textSize(s * 0.58);
+    const pw = textWidth(pauseLabel) + 22;
+    const px = chipX + chipW + 12;
+    const py = chipY;
+    pauseHit = { x: px, y: py, w: pw, h: chipH };
+
+    noFill();
+    stroke(paused ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
+    strokeWeight(1);
+    rect(px, py, pw, chipH, chipH / 2);
+    noStroke();
+    fill(paused ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
+    text(pauseLabel, px + pw / 2, py + chipH / 2 + 1);
+  }
 
   // Join button, drawn only while the room is not connected.
   joinHit = null;
@@ -1699,6 +1842,25 @@ function mousePressed() {
     return false;
   }
 
+  if (hitRect(pauseHit, mouseX, mouseY)) {
+    if (!shareConnected) {
+      paused = !paused;
+      if (!paused) foodSpawnTimer = Math.min(foodSpawnTimer, SPAWN_EVERY);
+    }
+    return false;
+  }
+
+  if (hitRect(yesHit, mouseX, mouseY)) {
+    if (shareConnected && paused) {
+      localReady = true;
+      const p = shared.pause || { active: true, day: dayNumber, votes: {} };
+      const votes = Object.assign({}, p.votes || {});
+      if (shareClientId) votes[shareClientId] = true;
+      shared.pause = { active: true, day: dayNumber, votes };
+    }
+    return false;
+  }
+
   if (fieldEntered && fieldLock > 0.3) {
     for (const o of ottos) o.pop = 1;
   }
@@ -1719,4 +1881,6 @@ function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
   joinHit = null;
   tuneHit = null;
+  pauseHit = null;
+  yesHit = null;
 }

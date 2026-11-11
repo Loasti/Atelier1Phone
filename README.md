@@ -50,7 +50,7 @@ The **green object** can be anything clearly green — a sticky note, a bottle c
 | Size | 1 | Scales the sprite, and counts as threat: a larger Otto is scarier to others. |
 | Sight | 8 | Radius, in field units, in which food and other Ottos are noticed. |
 | Aggression | 10 | Compared with ten times the other Otto's Size. Below it the Otto flees; at or above it the Otto hunts. |
-| EnergyRequirement | 50 | Food units needed per day. Energy drains steadily, and a four-minute day burns the whole requirement. |
+| EnergyRequirement | 50 | Food units needed per day. Energy drains steadily, and a one-minute day burns the whole requirement. |
 
 Decisions, in order, when the Otto looks around:
 
