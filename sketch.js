@@ -26,6 +26,7 @@ const FIELD_TILT = 0.55; // vertical squash, so the field reads as a tabletop pl
 const FIELD_RADIUS = 30; // Ottos stay inside this radius, and inside the screen
 const OTTO_UNITS_TALL = 3.2;
 const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
+const OTTO_COLLISION_SPACING = 0.4; // gentler per-frame spacing so food can be shared
 const EAT_RADIUS = 1.3;
 const CONTACT_RADIUS = 1.9;
 const FLEE_RANGE = 12;
@@ -112,6 +113,8 @@ let joinHit = null;
 let tuneHit = null;
 let pauseHit = null;
 let yesHit = null;
+let autoHit = null;
+let autoSkipDay = false;
 let panel = { open: false, rows: [], drag: null, fieldHit: null };
 
 // Pause state. Solo toggles locally; multiplayer waits for every connected
@@ -678,6 +681,11 @@ function updateBehaviour(dt) {
     }
   }
 
+  // Keep only this phone's own Ottos from overlapping. Remote colonies are a
+  // different team, so they are intentionally left alone. The per-frame radius
+  // is smaller than the post-reproduction one so two Ottos can share food.
+  separateOttos(1, OTTO_COLLISION_SPACING);
+
   dayClock += dt;
   if (dayClock >= DAY_SECONDS) {
     dayClock = 0;
@@ -727,8 +735,18 @@ function endOfDay() {
   paused = true;
   pauseDay = dayNumber;
   localReady = false;
-  if (shareConnected) {
-    shared.pause = { active: true, day: dayNumber, votes: {} };
+
+  if (autoSkipDay && !shareConnected) {
+    // Solo: skip the confirmation entirely.
+    paused = false;
+    foodSpawnTimer = 0;
+  } else if (shareConnected) {
+    const votes = {};
+    if (autoSkipDay && shareClientId) {
+      votes[shareClientId] = true;
+      localReady = true;
+    }
+    shared.pause = { active: true, day: dayNumber, votes };
   }
 }
 
@@ -755,7 +773,7 @@ function reproduce(parent) {
 
 // Sprites are nearly three field units wide, so a newborn at the parent's
 // feet would be hidden behind it. Push overlapping pairs apart after births.
-function separateOttos(rounds = 6) {
+function separateOttos(rounds = 6, spacing = OTTO_SPACING) {
   for (let r = 0; r < rounds; r++) {
     let moved = false;
 
@@ -765,7 +783,7 @@ function separateOttos(rounds = 6) {
         const b = ottos[j];
         const dx = b.pos.x - a.pos.x;
         const dy = b.pos.y - a.pos.y;
-        const min = OTTO_SPACING * (a.stats.size + b.stats.size);
+        const min = spacing * (a.stats.size + b.stats.size);
         const d = Math.hypot(dx, dy);
         if (d >= min) continue;
 
@@ -1101,7 +1119,14 @@ function updateRemote(dt) {
         ? guests.filter((g) => g && (Array.isArray(g.ottos) || g.otto))
         : [];
       const needed = playerGuests.length + 1;
-      const have = Object.keys(p.votes || {}).length;
+
+      // Auto-skip means this player's YES is cast automatically each day.
+      if (autoSkipDay && shareClientId && !(p.votes && p.votes[shareClientId])) {
+        castLocalYes();
+      }
+
+      const votes = (shared.pause && shared.pause.votes) || {};
+      const have = Object.keys(votes).length;
       if (have >= needed) {
         paused = false;
         localReady = false;
@@ -1763,6 +1788,7 @@ function drawHud() {
 
   // Tracking and tuning, kept clear of the desktop QR in the top-right corner.
   pauseHit = null;
+  autoHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 7.45;
   const label = found ? 'LOCKED' : 'SEEKING';
@@ -1810,6 +1836,25 @@ function drawHud() {
     noStroke();
     fill(paused ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
     text(pauseLabel, px + pw / 2, py + chipH / 2 + 1);
+  }
+
+  // Auto-skip the day-end confirmation for this player.
+  if (!panel.open) {
+    const autoLabel = autoSkipDay ? 'AUTO ON' : 'AUTO OFF';
+    textSize(s * 0.58);
+    const aw = textWidth(autoLabel) + 22;
+    const ax = (pauseHit ? pauseHit.x + pauseHit.w : chipX + chipW) + 12;
+    const ay = chipY;
+    autoHit = { x: ax, y: ay, w: aw, h: chipH };
+
+    noFill();
+    stroke(autoSkipDay ? color(126, 255, 190, 170) : color(140, 230, 255, 85));
+    strokeWeight(1);
+    rect(ax, ay, aw, chipH, chipH / 2);
+    noStroke();
+    fill(autoSkipDay ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
+    textAlign(CENTER, CENTER);
+    text(autoLabel, ax + aw / 2, ay + chipH / 2 + 1);
   }
 
   // Join button, drawn only while the room is not connected.
@@ -2003,6 +2048,15 @@ function hitRect(r, x, y) {
   return !!r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
+function castLocalYes() {
+  if (!shareConnected || !paused) return;
+  localReady = true;
+  const p = shared.pause || { active: true, day: dayNumber, votes: {} };
+  const votes = Object.assign({}, p.votes || {});
+  if (shareClientId) votes[shareClientId] = true;
+  shared.pause = { active: true, day: dayNumber, votes };
+}
+
 function mousePressed() {
   // Any click while an Otto is being examined closes the view.
   if (examineClone) {
@@ -2035,6 +2089,19 @@ function mousePressed() {
     return false;
   }
 
+  if (hitRect(autoHit, mouseX, mouseY)) {
+    autoSkipDay = !autoSkipDay;
+    if (autoSkipDay && paused) {
+      if (!shareConnected) {
+        paused = false;
+        foodSpawnTimer = Math.min(foodSpawnTimer, SPAWN_EVERY);
+      } else {
+        castLocalYes();
+      }
+    }
+    return false;
+  }
+
   if (hitRect(pauseHit, mouseX, mouseY)) {
     if (!shareConnected) {
       paused = !paused;
@@ -2044,13 +2111,7 @@ function mousePressed() {
   }
 
   if (hitRect(yesHit, mouseX, mouseY)) {
-    if (shareConnected && paused) {
-      localReady = true;
-      const p = shared.pause || { active: true, day: dayNumber, votes: {} };
-      const votes = Object.assign({}, p.votes || {});
-      if (shareClientId) votes[shareClientId] = true;
-      shared.pause = { active: true, day: dayNumber, votes };
-    }
+    castLocalYes();
     return false;
   }
 
@@ -2087,4 +2148,5 @@ function windowResized() {
   tuneHit = null;
   pauseHit = null;
   yesHit = null;
+  autoHit = null;
 }
