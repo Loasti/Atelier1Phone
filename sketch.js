@@ -29,6 +29,7 @@ const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
 const OTTO_COLLISION_SPACING = 0.9; // gentler per-frame spacing so food can be shared
 const EAT_RADIUS = 1.3;
 const CONTACT_RADIUS = 1.9;
+const FIGHT_STANDOFF = 0.85; // fraction of combined sprite half-widths
 const FLEE_RANGE = 12;
 
 // Food and time.
@@ -148,7 +149,7 @@ async function setup() {
     host: SHARE_HOST,
     room: SHARE_ROOM,
     app: SHARE_APP,
-    shared: { food: {} },
+    shared: { food: {}, timeScale: 1 },
     me: {
       name: 'Otto',
       ottos: [],
@@ -194,6 +195,7 @@ function shareReady() {
   }
   remote.clear();
   if (typeof shared.foodDay !== 'number') shared.foodDay = 0;
+  if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
   if (shareIsHost && Object.keys(shared.food || {}).length === 0) {
     const fresh = {};
     seedFood(fresh, FOOD_PER_DAY);
@@ -231,7 +233,7 @@ function defaultStats() {
     speed: 2.5,
     size: 1,
     sight: 8,
-    aggression: 10,
+    aggression: 9,
   };
 }
 
@@ -469,7 +471,10 @@ function draw() {
   if (!paused) {
     // Full-simulation speed boost. Substepping keeps movement and collisions
     // stable when the day clock is running at 10× or 100×.
-    const simDt = dt * timeScale;
+    const activeTimeScale = shareConnected && typeof shared.timeScale === 'number'
+      ? shared.timeScale
+      : timeScale;
+    const simDt = dt * activeTimeScale;
     const steps = constrain(Math.ceil(simDt / 0.05), 1, 40);
     const stepDt = simDt / steps;
     for (let i = 0; i < steps; i++) {
@@ -946,7 +951,43 @@ function moveOtto(o, dt) {
     o.moving = true;
   }
 
-  if (o.mode === 'hunt') fightIfTouching(o);
+  if (o.mode === 'hunt') {
+    fightIfTouching(o);
+    keepBesideFoe(o);
+  }
+}
+
+function ottoHalfWidth(size) {
+  return 0.5 * OTTO_UNITS_TALL * size * (OTTO_CROP.w / OTTO_CROP.h);
+}
+
+function fightStandoff(aSize, bSize) {
+  return Math.max(1.4, FIGHT_STANDOFF * (ottoHalfWidth(aSize) + ottoHalfWidth(bSize)));
+}
+
+// While hunting, hold the local Otto at the standoff edge so it fights beside
+// the foe rather than sliding inside it. Only this phone moves its own Otto;
+// the other phone applies the same rule to its own.
+function keepBesideFoe(o) {
+  const foe = o.target && o.target.foe;
+  if (!foe || !remote.has(foe.id) || foe.hp <= 0) return;
+
+  const standoff = fightStandoff(o.stats.size, foe.size);
+  let dx = o.pos.x - foe.x;
+  let dy = o.pos.y - foe.y;
+  let d = Math.hypot(dx, dy);
+  if (d >= standoff) return;
+
+  if (d < 0.001) {
+    const a = Math.random() * Math.PI * 2;
+    dx = Math.cos(a);
+    dy = Math.sin(a);
+    d = 1;
+  }
+
+  const push = (standoff - d) * 0.35;
+  o.pos.x += (dx / d) * push;
+  o.pos.y += (dy / d) * push;
 }
 
 function fightIfTouching(o) {
@@ -954,21 +995,29 @@ function fightIfTouching(o) {
   const foe = o.target && o.target.foe;
   if (!foe || !remote.has(foe.id) || foe.hp <= 0) return;
 
+  const standoff = fightStandoff(o.stats.size, foe.size);
   const d = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
-  if (d > CONTACT_RADIUS + foe.size * 0.4) return;
+  if (d > standoff + 0.05) return;
 
   o.fightCd = FIGHT_COOLDOWN;
   const win = o.stats.attack >= foe.attack;
   const bite = Math.max(2, foe.attack * 0.6);
   o.hp = Math.max(0, o.hp - (win ? bite * 0.4 : bite));
 
-  // Bounce apart. The other phone runs the same comparison from the same
-  // broadcast stats, so both creatures see the same result.
-  const nx = o.pos.x - foe.x || 0.001;
-  const ny = o.pos.y - foe.y || 0.001;
-  const n = Math.hypot(nx, ny);
-  o.pos.x += (nx / n) * 2.4;
-  o.pos.y += (ny / n) * 2.4;
+  // Resolve to the standoff edge plus a small knockback. Both phones run the
+  // same comparison from the broadcast stats, so both back out to their side.
+  let nx = o.pos.x - foe.x;
+  let ny = o.pos.y - foe.y;
+  let n = Math.hypot(nx, ny);
+  if (n < 0.001) {
+    const a = Math.random() * Math.PI * 2;
+    nx = Math.cos(a);
+    ny = Math.sin(a);
+    n = 1;
+  }
+  const out = standoff + 0.3;
+  o.pos.x = foe.x + (nx / n) * out;
+  o.pos.y = foe.y + (ny / n) * out;
   o.pop = 1;
   o.wander = null;
 
@@ -1883,9 +1932,13 @@ function drawHud() {
     text(autoLabel, ax + aw / 2, ay + chipH / 2 + 1);
   }
 
-  // Simulation-speed toggle for testing.
+  // Simulation-speed toggle for testing. In a shared room it is global.
   if (!panel.open) {
-    const timeLabel = `${timeScale}×`;
+    const shownScale =
+      shareConnected && typeof shared.timeScale === 'number'
+        ? shared.timeScale
+        : timeScale;
+    const timeLabel = `${shownScale}×`;
     textSize(s * 0.58);
     const tw = textWidth(timeLabel) + 22;
     const tx = (autoHit ? autoHit.x + autoHit.w : chipX + chipW) + 12;
@@ -1893,11 +1946,11 @@ function drawHud() {
     timeHit = { x: tx, y: ty, w: tw, h: chipH };
 
     noFill();
-    stroke(timeScale > 1 ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
+    stroke(shownScale > 1 ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
     strokeWeight(1);
     rect(tx, ty, tw, chipH, chipH / 2);
     noStroke();
-    fill(timeScale > 1 ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
+    fill(shownScale > 1 ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
     textAlign(CENTER, CENTER);
     text(timeLabel, tx + tw / 2, ty + chipH / 2 + 1);
   }
@@ -2135,7 +2188,13 @@ function mousePressed() {
   }
 
   if (hitRect(timeHit, mouseX, mouseY)) {
-    timeScale = timeScale === 1 ? 10 : timeScale === 10 ? 100 : 1;
+    const current =
+      shareConnected && typeof shared.timeScale === 'number'
+        ? shared.timeScale
+        : timeScale;
+    const next = current === 1 ? 10 : current === 10 ? 100 : 1;
+    timeScale = next;
+    if (shareConnected) shared.timeScale = next;
     return false;
   }
 
