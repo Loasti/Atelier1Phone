@@ -21,21 +21,22 @@ const OTTO_CROP = { x: 109, y: 135, w: 135, h: 149 };
 // units across, so a 7 cm sticky note makes one unit about 1.75 cm. Sight,
 // speed and food distances are all in these units, which keeps the behaviour
 // physical: moving the phone closer scales the field, not the rules.
-const FIELD_UNITS_ACROSS = 4;
+const FIELD_UNITS_ACROSS = 8;
 const FIELD_TILT = 0.55; // vertical squash, so the field reads as a tabletop plane
-const FIELD_RADIUS = 30; // Ottos stay inside this radius, and inside the screen
+const FIELD_RADIUS = 20; // Ottos stay inside this radius, and inside the screen
 const OTTO_UNITS_TALL = 3.2;
 const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
-const OTTO_COLLISION_SPACING = 0.4; // gentler per-frame spacing so food can be shared
+const OTTO_COLLISION_SPACING = 0.9; // gentler per-frame spacing so food can be shared
 const EAT_RADIUS = 1.3;
 const CONTACT_RADIUS = 1.9;
 const FLEE_RANGE = 12;
 
 // Food and time.
 const FOOD_AMOUNT = 10;
-const FOOD_MAX = 6;
+const FOOD_MAX = 30;
+const FOOD_PER_DAY = 30;
 const FOOD_RADIUS = 0.45;
-const SPAWN_EVERY = 5;
+
 const DAY_SECONDS = 60; // one day: food is tallied and reproduction is checked
 
 // An Otto burns ENERGY_PER_SIZE × its Size every day. The requirement is
@@ -99,7 +100,7 @@ let ottoFills = [];
 let field;
 let remote = new Map();
 let localFood = {};
-let foodSpawnTimer = 0;
+let localFoodDay = 0;
 
 let fieldEntered = false;
 let fieldLock = 0;
@@ -115,6 +116,8 @@ let pauseHit = null;
 let yesHit = null;
 let autoHit = null;
 let autoSkipDay = false;
+let timeHit = null;
+let timeScale = 1; // 1×, 10× or 100× for testing
 let panel = { open: false, rows: [], drag: null, fieldHit: null };
 
 // Pause state. Solo toggles locally; multiplayer waits for every connected
@@ -169,7 +172,6 @@ async function setup() {
   }
 
   resetTracking();
-  seedFood(localFood, 3);
   lastMillis = millis() / 1000;
 
   cam = createPhoneCamera('environment', false, 'cover');
@@ -191,15 +193,20 @@ function shareReady() {
     localReady = false;
   }
   remote.clear();
-  foodSpawnTimer = 0;
-  if (shareIsHost) seedFood(shared.food, 3);
+  if (typeof shared.foodDay !== 'number') shared.foodDay = 0;
+  if (shareIsHost && Object.keys(shared.food || {}).length === 0) {
+    const fresh = {};
+    seedFood(fresh, FOOD_PER_DAY);
+    shared.food = fresh;
+    shared.foodDay = dayNumber;
+  }
 }
 
 function resetTracking() {
   marker = { found: false, x: 0, y: 0, w: 0, h: 0, size: 0 };
   field = { ok: false, x: 0, y: 0, px: 40, tx: 0, ty: 0, tpx: 40 };
   localFood = {};
-  foodSpawnTimer = 0;
+  localFoodDay = 0;
 
   nextOttoId = 1;
   ottos = [createOtto(defaultStats(), 0, 0)];
@@ -459,8 +466,19 @@ function draw() {
     if (markerLost > 0.12) fieldLock *= Math.exp(-dt / 0.18);
   }
 
-  if (!paused && fieldEntered && field.ok) updateBehaviour(dt);
-  if (!paused) updateFood(dt);
+  if (!paused) {
+    // Full-simulation speed boost. Substepping keeps movement and collisions
+    // stable when the day clock is running at 10× or 100×.
+    const simDt = dt * timeScale;
+    const steps = constrain(Math.ceil(simDt / 0.05), 1, 40);
+    const stepDt = simDt / steps;
+    for (let i = 0; i < steps; i++) {
+      if (fieldEntered && field.ok) updateBehaviour(stepDt, false);
+      updateFood(stepDt);
+      if (paused) break;
+    }
+    if (fieldEntered && field.ok) syncMe();
+  }
 
   drawFood();
   if (showField) drawFieldDebug();
@@ -608,18 +626,10 @@ function updateField(dt) {
   field.px = lerp(field.px, field.tpx, ks);
 }
 
-// How far an Otto may roam before it would leave the camera view. The marker
-// is rarely centred, so this shrinks towards the nearest screen edge.
+// The tabletop field has one fixed radius around the marker on every phone.
+// Screen edges no longer shrink it, so the rules are consistent across devices.
 function fieldLimit(size) {
-  if (!field || !field.ok) return 3;
-  const tall = typeof size === 'number' ? size : 1;
-  const pxy = field.px * FIELD_TILT;
-  const sprite = OTTO_UNITS_TALL * tall * field.px;
-  const acrossX = Math.min(field.x, width - field.x) / field.px;
-  const down = (height - field.y) / pxy;
-  const up = (field.y - sprite) / pxy;
-  const limit = Math.min(acrossX, down, Math.max(0.5, up));
-  return Math.max(3, Math.min(FIELD_RADIUS, limit * 0.85));
+  return FIELD_RADIUS;
 }
 
 function fieldToScreen(fx, fy) {
@@ -647,7 +657,7 @@ function enterField() {
 
 // ---------------------------------------------------------------- behaviour
 
-function updateBehaviour(dt) {
+function updateBehaviour(dt, sync = true) {
   for (const o of ottos) {
     if (o.dead) {
       o.death += dt;
@@ -698,20 +708,27 @@ function updateBehaviour(dt) {
     if (o.dead && o.death >= DEATH_LINGER) ottos.splice(i, 1);
   }
 
-  syncMe();
+  if (sync) syncMe();
 }
 
 // Reproduction is checked once, when the day's food is tallied. Every Otto
 // then starts the next day empty, including the new children.
 function endOfDay() {
   const parents = [];
-  for (const o of ottos) {
-    if (
-      !o.dead &&
-      o.energy >= energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT
-    ) {
-      parents.push(o);
+
+  // Any Otto that did not eat its daily requirement starves and is removed.
+  // Survivors at two days' food become parents; the rest simply carry on.
+  for (let i = ottos.length - 1; i >= 0; i--) {
+    const o = ottos[i];
+    if (o.dead) continue;
+    const need = energyRequirementFor(o.stats.size);
+    if (o.energy < need) {
+      o.hp = 0;
+      o.dead = true;
+      ottos.splice(i, 1);
+      continue;
     }
+    if (o.energy >= need * ENERGY_STORE_MULT) parents.push(o);
   }
 
   const before = ottos.length;
@@ -730,6 +747,10 @@ function endOfDay() {
 
   dayNumber += 1;
 
+  // Clear the old day's food; the new 30 pieces appear when play resumes.
+  if (shareConnected) shared.food = {};
+  else localFood = {};
+
   // A new day begins paused. In solo the player can resume immediately; in a
   // shared room everyone must tap YES before the day (and food spawning) starts.
   paused = true;
@@ -739,7 +760,6 @@ function endOfDay() {
   if (autoSkipDay && !shareConnected) {
     // Solo: skip the confirmation entirely.
     paused = false;
-    foodSpawnTimer = 0;
   } else if (shareConnected) {
     const votes = {};
     if (autoSkipDay && shareClientId) {
@@ -902,7 +922,7 @@ function moveOtto(o, dt) {
 
   let tx = t.x;
   let ty = t.y;
-  let speed = st.speed * (o.energy <= 0 ? 0.45 : 1);
+  let speed = st.speed;
 
   if (o.mode === 'flee') {
     const dx = o.pos.x - t.x;
@@ -985,18 +1005,24 @@ function currentFood() {
   return localFood;
 }
 
+// Food is reset once per day: 30 fresh pieces in random positions. There is no
+// continuous timer-based topping up anymore.
 function updateFood(dt) {
-  const store = currentFood();
-  if (!store) return;
+  if (paused) return;
 
-  // Any phone may top up the room, not just the host. Spawning stays capped at
-  // FOOD_MAX, so a room whose host is an old or idle client still gets food.
-  foodSpawnTimer -= dt;
-  if (foodSpawnTimer > 0) return;
-
-  foodSpawnTimer = SPAWN_EVERY;
-  const count = Object.keys(store).length;
-  seedFood(store, count === 0 ? 2 : 1);
+  if (shareConnected) {
+    if (shared.foodDay === dayNumber) return;
+    const fresh = {};
+    seedFood(fresh, FOOD_PER_DAY);
+    shared.food = fresh;
+    shared.foodDay = dayNumber;
+  } else {
+    if (localFoodDay === dayNumber) return;
+    const fresh = {};
+    seedFood(fresh, FOOD_PER_DAY);
+    localFood = fresh;
+    localFoodDay = dayNumber;
+  }
 }
 
 function seedFood(store, howMany) {
@@ -1131,7 +1157,6 @@ function updateRemote(dt) {
         paused = false;
         localReady = false;
         shared.pause = { active: false, day: dayNumber, votes: {} };
-        foodSpawnTimer = 0;
       }
     } else if (!p.active || p.day !== dayNumber) {
       paused = false;
@@ -1789,6 +1814,7 @@ function drawHud() {
   // Tracking and tuning, kept clear of the desktop QR in the top-right corner.
   pauseHit = null;
   autoHit = null;
+  timeHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 7.45;
   const label = found ? 'LOCKED' : 'SEEKING';
@@ -1855,6 +1881,25 @@ function drawHud() {
     fill(autoSkipDay ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
     textAlign(CENTER, CENTER);
     text(autoLabel, ax + aw / 2, ay + chipH / 2 + 1);
+  }
+
+  // Simulation-speed toggle for testing.
+  if (!panel.open) {
+    const timeLabel = `${timeScale}×`;
+    textSize(s * 0.58);
+    const tw = textWidth(timeLabel) + 22;
+    const tx = (autoHit ? autoHit.x + autoHit.w : chipX + chipW) + 12;
+    const ty = chipY;
+    timeHit = { x: tx, y: ty, w: tw, h: chipH };
+
+    noFill();
+    stroke(timeScale > 1 ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
+    strokeWeight(1);
+    rect(tx, ty, tw, chipH, chipH / 2);
+    noStroke();
+    fill(timeScale > 1 ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
+    textAlign(CENTER, CENTER);
+    text(timeLabel, tx + tw / 2, ty + chipH / 2 + 1);
   }
 
   // Join button, drawn only while the room is not connected.
@@ -2089,12 +2134,16 @@ function mousePressed() {
     return false;
   }
 
+  if (hitRect(timeHit, mouseX, mouseY)) {
+    timeScale = timeScale === 1 ? 10 : timeScale === 10 ? 100 : 1;
+    return false;
+  }
+
   if (hitRect(autoHit, mouseX, mouseY)) {
     autoSkipDay = !autoSkipDay;
     if (autoSkipDay && paused) {
       if (!shareConnected) {
         paused = false;
-        foodSpawnTimer = Math.min(foodSpawnTimer, SPAWN_EVERY);
       } else {
         castLocalYes();
       }
@@ -2103,10 +2152,7 @@ function mousePressed() {
   }
 
   if (hitRect(pauseHit, mouseX, mouseY)) {
-    if (!shareConnected) {
-      paused = !paused;
-      if (!paused) foodSpawnTimer = Math.min(foodSpawnTimer, SPAWN_EVERY);
-    }
+    if (!shareConnected) paused = !paused;
     return false;
   }
 
@@ -2149,4 +2195,5 @@ function windowResized() {
   pauseHit = null;
   yesHit = null;
   autoHit = null;
+  timeHit = null;
 }
