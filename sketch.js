@@ -23,7 +23,7 @@ const OTTO_CROP = { x: 109, y: 135, w: 135, h: 149 };
 // physical: moving the phone closer scales the field, not the rules.
 const FIELD_UNITS_ACROSS = 4;
 const FIELD_TILT = 0.55; // vertical squash, so the field reads as a tabletop plane
-const FIELD_RADIUS = 22; // Ottos stay inside this radius, and inside the screen
+const FIELD_RADIUS = 30; // Ottos stay inside this radius, and inside the screen
 const OTTO_UNITS_TALL = 3.2;
 const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
 const EAT_RADIUS = 1.3;
@@ -63,7 +63,7 @@ const COLONY_COLORS = [
   [166, 255, 92], // lime
   [255, 190, 60], // amber
 ];
-const OTTO_TINT_ALPHA = 0.4; // ink shifts slightly towards the colony colour
+const OTTO_TINT_ALPHA = 0.2; // ink shifts slightly towards the colony colour
 const OTTO_FILL_ALPHA = 0.42; // soft fill inside the line art
 
 const STAT_DEFS = {
