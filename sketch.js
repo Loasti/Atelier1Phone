@@ -46,6 +46,25 @@ const MUTATE = 0.2; // child stat spread, ±20%
 const MUTATE_SIZE = 0.15; // Size mutates a little more gently
 
 const FIGHT_COOLDOWN = 1.1;
+const MAX_HP = 100;
+const DEATH_LINGER = 0.8; // dead Ottos stay visible briefly so peers see hp reach 0
+
+// Colony colours. Every phone sees the same assignment because the palette is
+// handed out in sorted client-ID order, not by who connected first.
+const COLONY_COLORS = [
+  [63, 208, 255], // cyan
+  [255, 150, 70], // orange
+  [255, 92, 180], // magenta
+  [255, 224, 90], // yellow
+  [170, 130, 255], // violet
+  [255, 90, 90], // red
+  [80, 235, 170], // mint
+  [120, 170, 255], // blue
+  [166, 255, 92], // lime
+  [255, 190, 60], // amber
+];
+const OTTO_TINT_ALPHA = 0.4; // ink shifts slightly towards the colony colour
+const OTTO_FILL_ALPHA = 0.42; // soft fill inside the line art
 
 const STAT_DEFS = {
   attack: { label: 'ATTACK', min: 1, max: 30, step: 1 },
@@ -72,7 +91,10 @@ let stack;
 
 let marker;
 let ottos = [];
+let nextOttoId = 1;
 let ottoGif;
+let ottoLayer = null;
+let ottoFills = [];
 let field;
 let remote = new Map();
 let localFood = {};
@@ -122,6 +144,7 @@ async function setup() {
   ottoGif = null;
   try {
     ottoGif = await loadImage('Otto1.gif');
+    prepareOttoArt();
   } catch (e) {
     console.warn('Could not load Otto1.gif', e);
   }
@@ -150,6 +173,7 @@ function resetTracking() {
   localFood = {};
   foodSpawnTimer = 0;
 
+  nextOttoId = 1;
   ottos = [createOtto(defaultStats(), 0, 0)];
   fieldEntered = false;
   fieldLock = 0;
@@ -177,6 +201,7 @@ function energyRequirementFor(size) {
 function createOtto(stats, x, y) {
   const st = stats || defaultStats();
   return {
+    id: nextOttoId++,
     pos: { x: x || 0, y: y || 0 },
     facing: 1,
     moving: false,
@@ -187,6 +212,9 @@ function createOtto(stats, x, y) {
     wander: null,
     think: 0,
     fightCd: 0,
+    hp: MAX_HP,
+    dead: false,
+    death: 0,
     energy: 0, // food eaten so far today; every Otto starts the day empty
     stats: st,
   };
@@ -255,6 +283,7 @@ function draw() {
 
   drawFood();
   if (showField) drawFieldDebug();
+  drawColonyRings();
   drawRemoteOttos();
   drawLocalOttos();
   drawHud();
@@ -436,6 +465,12 @@ function enterField() {
 
 function updateBehaviour(dt) {
   for (const o of ottos) {
+    if (o.dead) {
+      o.death += dt;
+      o.pop *= Math.exp(-dt / 0.18);
+      continue;
+    }
+
     const st = o.stats;
 
     o.fightCd = Math.max(0, o.fightCd - dt);
@@ -468,6 +503,12 @@ function updateBehaviour(dt) {
     endOfDay();
   }
 
+  // Remove Ottos once their death fade has played out.
+  for (let i = ottos.length - 1; i >= 0; i--) {
+    const o = ottos[i];
+    if (o.dead && o.death >= DEATH_LINGER) ottos.splice(i, 1);
+  }
+
   syncMe();
 }
 
@@ -476,7 +517,10 @@ function updateBehaviour(dt) {
 function endOfDay() {
   const parents = [];
   for (const o of ottos) {
-    if (o.energy >= energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT) {
+    if (
+      !o.dead &&
+      o.energy >= energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT
+    ) {
       parents.push(o);
     }
   }
@@ -576,6 +620,7 @@ function chooseIntent(o) {
   let enemy = null;
   let enemyD = Infinity;
   for (const r of remote.values()) {
+    if (r.hp <= 0) continue;
     const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
     if (d <= st.sight + r.size * 0.6 && d < enemyD) {
       enemy = r;
@@ -677,9 +722,9 @@ function moveOtto(o, dt) {
 }
 
 function fightIfTouching(o) {
-  if (o.fightCd > 0) return;
+  if (o.dead || o.fightCd > 0) return;
   const foe = o.target && o.target.foe;
-  if (!foe || !remote.has(foe.id)) return;
+  if (!foe || !remote.has(foe.id) || foe.hp <= 0) return;
 
   const d = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
   if (d > CONTACT_RADIUS + foe.size * 0.4) return;
@@ -687,7 +732,7 @@ function fightIfTouching(o) {
   o.fightCd = FIGHT_COOLDOWN;
   const win = o.stats.attack >= foe.attack;
   const bite = Math.max(2, foe.attack * 0.6);
-  o.energy = Math.max(0, o.energy - (win ? bite * 0.4 : bite));
+  o.hp = Math.max(0, o.hp - (win ? bite * 0.4 : bite));
 
   // Bounce apart. The other phone runs the same comparison from the same
   // broadcast stats, so both creatures see the same result.
@@ -698,6 +743,15 @@ function fightIfTouching(o) {
   o.pos.y += (ny / n) * 2.4;
   o.pop = 1;
   o.wander = null;
+
+  if (o.hp <= 0) {
+    o.hp = 0;
+    o.dead = true;
+    o.death = 0;
+    o.mode = 'dead';
+    o.moving = false;
+    o.target = null;
+  }
 }
 
 function eatNearby(o, store) {
@@ -762,12 +816,14 @@ function syncMe() {
   const list = [];
   for (const o of ottos) {
     list.push({
+      id: o.id,
       x: Math.round(o.pos.x * 100) / 100,
       y: Math.round(o.pos.y * 100) / 100,
       size: Math.round(o.stats.size * 100) / 100,
       attack: o.stats.attack,
       aggression: o.stats.aggression,
       sight: o.stats.sight,
+      hp: Math.max(0, Math.round(o.hp)),
     });
   }
   me.ottos = list;
@@ -790,13 +846,14 @@ function updateRemote(dt) {
         const data = list[j];
         if (!data || typeof data.x !== 'number') continue;
 
-        const id = base + '#' + j;
+        const id = base + '#' + (data.id !== undefined ? data.id : j);
         seen.add(id);
 
         let r = remote.get(id);
         if (!r) {
           r = {
             id,
+            client: base,
             x: data.x,
             y: data.y,
             tx: data.x,
@@ -805,6 +862,9 @@ function updateRemote(dt) {
             attack: 10,
             aggression: 10,
             sight: 8,
+            hp: MAX_HP,
+            credited: false,
+            deadTime: 0,
             facing: 1,
             lock: 0,
           };
@@ -817,6 +877,21 @@ function updateRemote(dt) {
         r.attack = numberOr(data.attack, 10);
         r.aggression = numberOr(data.aggression, 10);
         r.sight = numberOr(data.sight, 8);
+        r.hp = numberOr(data.hp, MAX_HP);
+
+        // The loser's phone broadcasts hp 0 for a short death linger. The
+        // nearby living Otto on this phone is the victor and claims the food.
+        if (r.hp <= 0) {
+          r.deadTime += dt;
+          if (!r.credited) {
+            r.credited = true;
+            awardKill(r);
+          }
+        } else {
+          r.deadTime = 0;
+          r.credited = false;
+        }
+
         if (Math.abs(r.tx - r.x) > 0.02) r.facing = r.tx >= r.x ? 1 : -1;
       }
     }
@@ -833,6 +908,29 @@ function updateRemote(dt) {
     r.y = lerp(r.y, r.ty, k);
     r.lock = lerp(r.lock, 1, 1 - Math.exp(-dt / 0.15));
   }
+}
+
+function awardKill(foe) {
+  let victor = null;
+  let best = Infinity;
+
+  for (const o of ottos) {
+    if (o.dead || o.hp <= 0) continue;
+
+    const hunting = o.target && o.target.foe && o.target.foe.id === foe.id;
+    const d = Math.hypot(o.pos.x - foe.x, o.pos.y - foe.y);
+    if (!hunting && d > CONTACT_RADIUS * 2.5) continue;
+
+    const score = hunting ? d - 1000 : d;
+    if (score < best) {
+      best = score;
+      victor = o;
+    }
+  }
+
+  if (!victor) return;
+  victor.energy += Math.max(0, numberOr(foe.size, 1)) * 100;
+  victor.pop = 1;
 }
 
 function numberOr(v, fallback) {
@@ -859,11 +957,232 @@ function drawWaiting(now) {
   );
 }
 
+// ------------------------------------------------------------- colony colours
+
+function rgbColor(c) {
+  return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+}
+
+function colonyColorMap() {
+  const ids = new Set();
+
+  if (window.shareClientId) ids.add(window.shareClientId);
+  if (typeof guests !== 'undefined' && Array.isArray(guests)) {
+    for (const g of guests) if (g && g.id) ids.add(g.id);
+  }
+  for (const r of remote.values()) if (r.client) ids.add(r.client);
+
+  const sorted = [...ids].sort();
+  const map = new Map();
+  for (let i = 0; i < sorted.length; i++) {
+    map.set(sorted[i], COLONY_COLORS[i % COLONY_COLORS.length]);
+  }
+  return map;
+}
+
+function colonyColorFor(clientId) {
+  if (!clientId) return COLONY_COLORS[0];
+  return colonyColorMap().get(clientId) || COLONY_COLORS[0];
+}
+
+// Otto1.gif is line art: the body is transparent. Tinting with source-atop
+// would only recolour the ink, so the enclosed area is filled separately with
+// a soft colour and drawn behind the line work.
+function prepareOttoArt() {
+  ottoFills = [];
+  if (!ottoGif) return;
+
+  ottoLayer = createGraphics(OTTO_CROP.w, OTTO_CROP.h);
+  ottoLayer.pixelDensity(1);
+
+  const props = ottoGif.gifProperties;
+  if (props && Array.isArray(props.frames)) {
+    for (const frame of props.frames) {
+      ottoFills.push(buildOttoFills(frame.image));
+    }
+  } else if (ottoGif.canvas) {
+    const c = document.createElement('canvas');
+    c.width = ottoGif.canvas.width;
+    c.height = ottoGif.canvas.height;
+    const cx = c.getContext('2d');
+    cx.drawImage(ottoGif.canvas, 0, 0);
+    ottoFills.push(
+      buildOttoFills(cx.getImageData(0, 0, c.width, c.height))
+    );
+  }
+}
+
+// Build one coloured fill canvas per palette entry for a single GIF frame.
+function buildOttoFills(src) {
+  const W = OTTO_CROP.w;
+  const H = OTTO_CROP.h;
+  const solid = new Uint8Array(W * H);
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const sx = x + OTTO_CROP.x;
+      const sy = y + OTTO_CROP.y;
+      if (sx < 0 || sy < 0 || sx >= src.width || sy >= src.height) continue;
+      const a = src.data[(sy * src.width + sx) * 4 + 3];
+      if (a > 24) solid[y * W + x] = 1;
+    }
+  }
+
+  // Flood fill from the border to find the transparent area outside the
+  // creature. Anything transparent and unreachable is body interior.
+  const outside = new Uint8Array(W * H);
+  const stack = [];
+  const push = (x, y) => {
+    const k = y * W + x;
+    if (!solid[k] && !outside[k]) {
+      outside[k] = 1;
+      stack.push(k);
+    }
+  };
+
+  for (let x = 0; x < W; x++) {
+    push(x, 0);
+    push(x, H - 1);
+  }
+  for (let y = 0; y < H; y++) {
+    push(0, y);
+    push(W - 1, y);
+  }
+
+  while (stack.length) {
+    const k = stack.pop();
+    const x = k % W;
+    const y = (k - x) / W;
+    if (x > 0) push(x - 1, y);
+    if (x < W - 1) push(x + 1, y);
+    if (y > 0) push(x, y - 1);
+    if (y < H - 1) push(x, y + 1);
+  }
+
+  const inside = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    if (!solid[i] && !outside[i]) inside[i] = 1;
+  }
+
+  // Let the fill slip one pixel under the inked edge to avoid a pale seam.
+  const expanded = inside.slice();
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const k = y * W + x;
+      if (!inside[k]) continue;
+      if (x > 0 && solid[k - 1]) expanded[k - 1] = 1;
+      if (x < W - 1 && solid[k + 1]) expanded[k + 1] = 1;
+      if (y > 0 && solid[k - W]) expanded[k - W] = 1;
+      if (y < H - 1 && solid[k + W]) expanded[k + W] = 1;
+    }
+  }
+
+  const mask = document.createElement('canvas');
+  mask.width = W;
+  mask.height = H;
+  const mctx = mask.getContext('2d');
+  const img = mctx.createImageData(W, H);
+  for (let i = 0; i < W * H; i++) {
+    if (!expanded[i]) continue;
+    img.data[i * 4] = 255;
+    img.data[i * 4 + 1] = 255;
+    img.data[i * 4 + 2] = 255;
+    img.data[i * 4 + 3] = 255;
+  }
+  mctx.putImageData(img, 0, 0);
+
+  const fills = [];
+  for (const col of COLONY_COLORS) {
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    const cx = c.getContext('2d');
+    cx.drawImage(mask, 0, 0);
+    cx.globalCompositeOperation = 'source-in';
+    cx.fillStyle = rgbColor(col);
+    cx.fillRect(0, 0, W, H);
+    fills.push(c);
+  }
+  return fills;
+}
+
+function ottoFillFor(frame, color) {
+  if (!ottoFills.length) return null;
+  const set = ottoFills[frame % ottoFills.length] || ottoFills[0];
+  const index = COLONY_COLORS.indexOf(color);
+  return set[index] || set[0] || null;
+}
+
+function drawColonyRing(ctx, cx, groundY, w, h, alpha, color) {
+  const rx = Math.max(8, w * 0.36);
+  const ry = rx * FIELD_TILT;
+
+  ctx.save();
+  ctx.fillStyle = rgbColor(color);
+  ctx.strokeStyle = rgbColor(color);
+
+  ctx.globalAlpha = alpha * 0.16;
+  ctx.beginPath();
+  ctx.ellipse(cx, groundY, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.globalAlpha = alpha * 0.95;
+  ctx.lineWidth = Math.max(1.5, h * 0.028);
+  ctx.beginPath();
+  ctx.ellipse(cx, groundY, rx, ry, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Rings are drawn in their own pass so every ring sits underneath every Otto,
+// rather than a nearer Otto's ring crossing an overlapping neighbour.
+function drawColonyRings() {
+  if (!field.ok || !ottoGif || fieldLock < 0.01) return;
+
+  const ctx = drawingContext;
+  const localColor = colonyColorFor(window.shareClientId);
+
+  for (const o of ottos) {
+    const fade = o.dead ? Math.max(0, 1 - o.death / DEATH_LINGER) : 1;
+    const alpha = fieldLock * o.spawn * fade;
+    if (alpha < 0.01) continue;
+    const p = fieldToScreen(o.pos.x, o.pos.y);
+    const h = OTTO_UNITS_TALL * o.stats.size * field.px * (1 + o.pop * 0.1);
+    const w = h * (OTTO_CROP.w / OTTO_CROP.h);
+    drawColonyRing(ctx, p.x, p.y, w, h, alpha, localColor);
+  }
+
+  for (const r of remote.values()) {
+    if (r.lock <= 0.01) continue;
+    const fade =
+      r.hp <= 0 ? Math.max(0, 1 - (r.deadTime || 0) / DEATH_LINGER) : 1;
+    const alpha = r.lock * fade;
+    if (alpha < 0.01) continue;
+    const p = fieldToScreen(r.x, r.y);
+    const h = OTTO_UNITS_TALL * r.size * field.px;
+    const w = h * (OTTO_CROP.w / OTTO_CROP.h);
+    drawColonyRing(ctx, p.x, p.y, w, h, alpha, colonyColorFor(r.client));
+  }
+}
+
 function drawLocalOttos() {
   if (!ottoGif || !field.ok || fieldLock < 0.01) return;
+  const color = colonyColorFor(window.shareClientId);
   for (const o of ottos) {
+    const fade = o.dead ? Math.max(0, 1 - o.death / DEATH_LINGER) : 1;
+    const alpha = fieldLock * o.spawn * fade;
+    if (alpha < 0.01) continue;
     const p = fieldToScreen(o.pos.x, o.pos.y);
-    drawOttoAt(p.x, p.y, o.stats.size, fieldLock * o.spawn, o.facing, o.pop);
+    drawOttoAt(
+      p.x,
+      p.y,
+      o.stats.size,
+      alpha,
+      o.facing,
+      o.pop,
+      o.hp / MAX_HP,
+      color
+    );
   }
 }
 
@@ -871,31 +1190,111 @@ function drawRemoteOttos() {
   if (!field.ok || !ottoGif) return;
   for (const r of remote.values()) {
     if (r.lock <= 0.01) continue;
+    const fade =
+      r.hp <= 0 ? Math.max(0, 1 - (r.deadTime || 0) / DEATH_LINGER) : 1;
+    const alpha = r.lock * fade;
+    if (alpha < 0.01) continue;
     const p = fieldToScreen(r.x, r.y);
-    drawOttoAt(p.x, p.y, r.size, r.lock, r.facing, 0);
+    drawOttoAt(
+      p.x,
+      p.y,
+      r.size,
+      alpha,
+      r.facing,
+      0,
+      r.hp / MAX_HP,
+      colonyColorFor(r.client)
+    );
   }
 }
 
-function drawOttoAt(cx, groundY, size, alpha, facing, pop) {
+function drawOttoAt(
+  cx,
+  groundY,
+  size,
+  alpha,
+  facing,
+  pop,
+  hpFrac = 1,
+  color = COLONY_COLORS[0]
+) {
   const h = OTTO_UNITS_TALL * size * field.px * (1 + pop * 0.1);
   const w = h * (OTTO_CROP.w / OTTO_CROP.h);
   const ctx = drawingContext;
+
+  // Draw the Otto into a small buffer so the body fill can sit behind the ink
+  // while the ink itself is tinted towards the colony colour.
+  if (ottoLayer) {
+    ottoLayer.clear();
+    ottoLayer.image(
+      ottoGif,
+      0,
+      0,
+      OTTO_CROP.w,
+      OTTO_CROP.h,
+      OTTO_CROP.x,
+      OTTO_CROP.y,
+      OTTO_CROP.w,
+      OTTO_CROP.h
+    );
+
+    const lc = ottoLayer.drawingContext;
+    const frame = ottoGif.gifProperties
+      ? ottoGif.gifProperties.displayIndex
+      : 0;
+    const fill = ottoFillFor(frame, color);
+
+    lc.save();
+    lc.globalCompositeOperation = 'source-atop';
+    lc.globalAlpha = OTTO_TINT_ALPHA;
+    lc.fillStyle = rgbColor(color);
+    lc.fillRect(0, 0, OTTO_CROP.w, OTTO_CROP.h);
+    lc.restore();
+
+    if (fill) {
+      lc.save();
+      lc.globalCompositeOperation = 'destination-over';
+      lc.globalAlpha = OTTO_FILL_ALPHA;
+      lc.drawImage(fill, 0, 0);
+      lc.restore();
+    }
+  }
 
   ctx.save();
   ctx.globalAlpha = alpha;
   ctx.translate(cx, groundY);
   ctx.scale(facing, 1);
-  image(
-    ottoGif,
-    -w / 2,
-    -h,
-    w,
-    h,
-    OTTO_CROP.x,
-    OTTO_CROP.y,
-    OTTO_CROP.w,
-    OTTO_CROP.h
-  );
+
+  if (ottoLayer) {
+    ctx.drawImage(ottoLayer.canvas, -w / 2, -h, w, h);
+  } else {
+    image(
+      ottoGif,
+      -w / 2,
+      -h,
+      w,
+      h,
+      OTTO_CROP.x,
+      OTTO_CROP.y,
+      OTTO_CROP.w,
+      OTTO_CROP.h
+    );
+  }
+
+  // Small health bar above a damaged Otto.
+  if (hpFrac < 0.999 && alpha > 0.03) {
+    const hp = constrain(hpFrac, 0, 1);
+    const bw = w * 0.7;
+    const bh = Math.max(2, h * 0.03);
+    const bx = -bw / 2;
+    const by = -h - bh * 2.5;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+    ctx.fillStyle =
+      hp > 0.5 ? '#7effbe' : hp > 0.25 ? '#ffd166' : '#ff6b6b';
+    ctx.fillRect(bx, by, bw * hp, bh);
+  }
+
   ctx.restore();
 }
 
@@ -1012,11 +1411,24 @@ function drawHud() {
   textSize(s * 0.66);
   text(roomText, 18, 16 + s * 2.95);
 
+  // The colour of this phone's colony, so "YOU" is easy to find on the table.
+  const myColor = colonyColorFor(window.shareClientId);
+  const roomW = textWidth(roomText);
+  const swX = 18 + roomW + s * 0.9;
+  const swY = 16 + s * 2.95 + s * 0.33;
+  fill(myColor[0], myColor[1], myColor[2], 235);
+  circle(swX, swY, s * 0.6);
+  fill(myColor[0], myColor[1], myColor[2], 210);
+  textSize(s * 0.55);
+  text('YOU', swX + s * 0.55, 16 + s * 2.95 + 1);
+
   // Stats.
   fill(170, 215, 235, 160);
   textSize(s * 0.6);
   text(
-    `ATK ${st.attack} · SPD ${st.speed.toFixed(1)} · SIZE ${st.size.toFixed(2)}`,
+    `ATK ${st.attack} · SPD ${st.speed.toFixed(1)} · SIZE ${st.size.toFixed(
+      2
+    )} · HP ${lead ? Math.max(0, Math.round(lead.hp)) : 0}/${MAX_HP}`,
     18,
     16 + s * 4.05
   );
@@ -1031,6 +1443,8 @@ function drawHud() {
       ? `ENERGY ${Math.round(lead.energy)}/${need * ENERGY_STORE_MULT} · ${
           MODE_LABEL[lead.mode] || ''
         } · OTTOS ${ottos.length} · DAY ${dayNumber}`
+      : fieldEntered
+      ? 'COLONY LOST · RELOAD TO BEGIN AGAIN'
       : 'NO OTTO YET · SHOW IT A GREEN OBJECT',
     18,
     16 + s * 6.15
