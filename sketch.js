@@ -31,6 +31,10 @@ const EAT_RADIUS = 1.3;
 const CONTACT_RADIUS = 1.9;
 const FIGHT_STANDOFF = 0.85; // fraction of combined sprite half-widths
 const FLEE_RANGE = 12;
+const FLEE_MIN_TIME = 2.5; // seconds of committed fleeing
+const FLEE_SAFE_MULT = 1.5; // threat must be this many sight radii away
+const FRIEND_SPACE = 0.8; // personal-space radius per combined half-width
+const FRIEND_STEER = 0.9; // how strongly friends bend the path
 
 // Food and time.
 const FOOD_AMOUNT = 10;
@@ -108,6 +112,7 @@ let fieldLock = 0;
 let markerLost = 0;
 let dayClock = 0;
 let dayNumber = 1;
+let simClock = 0;
 
 let lastMillis = 0;
 let scanTick = 0;
@@ -135,6 +140,14 @@ let examineSnapshot = null;
 let examineClone = null;
 let examineT = 0; // 0 = at the Otto, 1 = floating at centre
 let examineLeaving = false;
+let examineKind = 'local'; // 'local' or 'dev'
+
+// Dev mode: spawn fake enemy Ottos in solo space and edit their stats.
+let devMode = false;
+let devHit = null;
+let spawnHit = null;
+let devHits = [];
+let nextDevId = 1;
 
 async function setup() {
   createCanvas(windowWidth, windowHeight);
@@ -194,6 +207,7 @@ function shareReady() {
     localReady = false;
   }
   remote.clear();
+  devMode = false;
   if (typeof shared.foodDay !== 'number') shared.foodDay = 0;
   if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
   if (shareIsHost && Object.keys(shared.food || {}).length === 0) {
@@ -217,6 +231,7 @@ function resetTracking() {
   markerLost = 0;
   dayClock = 0;
   dayNumber = 1;
+  simClock = 0;
   paused = false;
   pauseDay = 0;
   localReady = false;
@@ -225,6 +240,12 @@ function resetTracking() {
   examineClone = null;
   examineT = 0;
   examineLeaving = false;
+  examineKind = 'local';
+  devMode = false;
+  devHit = null;
+  spawnHit = null;
+  devHits = [];
+  nextDevId = 1;
 }
 
 function defaultStats() {
@@ -257,6 +278,11 @@ function createOtto(stats, x, y) {
     wander: null,
     think: 0,
     fightCd: 0,
+    fleeUntil: 0,
+    fleeThreat: null,
+    threatX: null,
+    threatY: null,
+    threatAt: 0,
     hp: MAX_HP,
     dead: false,
     death: 0,
@@ -296,33 +322,126 @@ function ottoHit(o, x, y) {
   return Math.hypot(x - p.x, y - cy) < r;
 }
 
-function startExamine(o) {
-  examineRef = o;
-  examineSnapshot = {
-    id: o.id,
-    stats: { ...o.stats },
-    hp: o.hp,
-    energy: o.energy,
-    color: colonyColorFor(window.shareClientId),
-  };
-  const p = fieldToScreen(o.pos.x, o.pos.y);
+function devOttoHit(r, x, y) {
+  const p = fieldToScreen(r.x, r.y);
+  const h = OTTO_UNITS_TALL * r.size * field.px;
+  const cy = p.y - h * 0.5;
+  const rad = Math.max(20, h * 0.5);
+  return Math.hypot(x - p.x, y - cy) < rad;
+}
+
+function startExamine(target, kind = 'local') {
+  examineKind = kind;
+  examineRef = target;
+  const isLocal = kind === 'local';
+  const color = isLocal
+    ? colonyColorFor(window.shareClientId)
+    : target.color || COLONY_COLORS[0];
+
+  if (isLocal) {
+    examineSnapshot = {
+      id: target.id,
+      stats: { ...target.stats },
+      hp: target.hp,
+      energy: target.energy,
+      color,
+    };
+  } else {
+    examineSnapshot = {
+      id: target.id,
+      stats: {
+        attack: target.attack,
+        speed: target.speed || 2.5,
+        size: target.size,
+        sight: target.sight,
+        aggression: target.aggression,
+      },
+      hp: target.hp,
+      energy: 0,
+      color,
+    };
+  }
+
+  const px = isLocal ? target.pos.x : target.x;
+  const py = isLocal ? target.pos.y : target.y;
+  const startSize = isLocal ? target.stats.size : target.size;
+  const p = fieldToScreen(px, py);
   const targetHeight = Math.min(height * 0.34, width * 0.55);
   const targetSize = Math.max(0.4, targetHeight / (OTTO_UNITS_TALL * Math.max(1, field.px)));
   examineClone = {
     x: p.x,
     y: p.y,
-    size: o.stats.size,
+    size: startSize,
     startX: p.x,
     startY: p.y,
-    startSize: o.stats.size,
+    startSize,
     targetX: width * 0.58,
     targetY: height * 0.5,
     targetSize,
-    facing: o.facing,
-    color: colonyColorFor(window.shareClientId),
+    facing: target.facing || 1,
+    color,
   };
   examineT = 0;
   examineLeaving = false;
+}
+
+function spawnDevEnemy() {
+  if (shareConnected) return;
+  const n = nextDevId++;
+  const a = Math.random() * Math.PI * 2;
+  const reach = Math.max(2, fieldLimit(1) * 0.55);
+  const r = 3 + Math.random() * reach;
+  const entry = {
+    id: 'dev#' + n,
+    client: 'dev-' + n,
+    dev: true,
+    x: Math.cos(a) * r,
+    y: Math.sin(a) * r,
+    tx: Math.cos(a) * r,
+    ty: Math.sin(a) * r,
+    size: 0.7 + Math.random() * 0.9,
+    speed: 1.5 + Math.random() * 2,
+    attack: 6 + Math.floor(Math.random() * 10),
+    aggression: 6 + Math.floor(Math.random() * 10),
+    sight: 6 + Math.floor(Math.random() * 8),
+    hp: MAX_HP,
+    credited: false,
+    deadTime: 0,
+    facing: 1,
+    lock: 1,
+    color: COLONY_COLORS[1 + (n % Math.max(1, COLONY_COLORS.length - 1))],
+  };
+  remote.set(entry.id, entry);
+}
+
+function adjustDevStat(key, dir) {
+  if (!examineRef) return;
+  const isLocal = examineKind === 'local';
+  const def = STAT_DEFS[key];
+  const step = key === 'hp' ? 5 : def ? def.step : 1;
+
+  if (key === 'hp') {
+    examineRef.hp = constrain(Math.round(examineRef.hp + dir * step), 1, MAX_HP);
+  } else if (isLocal) {
+    let v = examineRef.stats[key] + dir * step;
+    v = def.min + Math.round((v - def.min) / def.step) * def.step;
+    v = Math.round(v * 1000) / 1000;
+    examineRef.stats[key] = constrain(v, def.min, def.max);
+  } else {
+    let v = (examineRef[key] == null ? def.min : examineRef[key]) + dir * step;
+    v = def.min + Math.round((v - def.min) / def.step) * def.step;
+    v = Math.round(v * 1000) / 1000;
+    examineRef[key] = constrain(v, def.min, def.max);
+  }
+
+  if (examineSnapshot) {
+    if (key === 'hp') examineSnapshot.hp = examineRef.hp;
+    else {
+      examineSnapshot.stats[key] = isLocal
+        ? examineRef.stats[key]
+        : examineRef[key];
+    }
+  }
 }
 
 function dismissExamine() {
@@ -358,20 +477,35 @@ function drawExamineClone() {
 }
 
 function drawStatsCard() {
+  devHits = [];
   if (!examineClone || examineT < 0.15) return;
   const ref = examineRef;
   const snap = examineSnapshot;
   if (!snap) return;
 
-  const st = ref && !ref.dead ? ref.stats : snap.stats;
-  const hp = ref && !ref.dead ? ref.hp : snap.hp;
-  const energy = ref && !ref.dead ? ref.energy : snap.energy;
+  const isLocal = examineKind === 'local';
+  const refUsable =
+    ref && (isLocal ? !ref.dead : true);
+  const st = refUsable
+    ? isLocal
+      ? ref.stats
+      : {
+          attack: ref.attack,
+          speed: ref.speed == null ? 2.5 : ref.speed,
+          size: ref.size,
+          sight: ref.sight,
+          aggression: ref.aggression,
+        }
+    : snap.stats;
+  const hp = refUsable ? ref.hp : snap.hp;
+  const energy = refUsable && isLocal ? ref.energy : snap.energy;
   const id = snap.id;
   const need = energyRequirementFor(st.size);
+  const editable = devMode && !shareConnected;
 
   const s = constrain(width * 0.031, 10, 16);
-  const cardW = s * 15.5;
-  const cardH = s * 11;
+  const cardW = editable ? s * 18 : s * 15.5;
+  const cardH = editable ? s * 12.5 : s * 11;
   let cardX = examineClone.x - cardW - s * 3;
   let cardY = examineClone.y - cardH * 0.55;
   cardX = constrain(cardX, 12, width - cardW - 12);
@@ -389,7 +523,7 @@ function drawStatsCard() {
   noStroke();
   fill(4, 10, 16, 220);
   rect(cardX, cardY, cardW, cardH, 10);
-  stroke(126, 255, 190, 120);
+  stroke(editable ? color(255, 200, 110, 150) : color(126, 255, 190, 120));
   strokeWeight(1);
   noFill();
   rect(cardX, cardY, cardW, cardH, 10);
@@ -398,34 +532,84 @@ function drawStatsCard() {
   textAlign(LEFT, TOP);
   fill(240, 252, 255, 235);
   textSize(s * 0.8);
-  text(`OTTO ${id}`, cardX + 10, cardY + 7);
+  text(`OTTO ${id}${isLocal ? '' : ' · DEV'}`, cardX + 10, cardY + 7);
 
-  const rows = [
-    ['ATTACK', st.attack],
-    ['SPEED', st.speed.toFixed(1)],
-    ['SIZE', st.size.toFixed(2)],
-    ['SIGHT', st.sight.toFixed(0)],
-    ['AGGRESSION', st.aggression],
-    ['ENERGY/DAY', need],
-    ['HP', `${Math.max(0, Math.round(hp))}/${MAX_HP}`],
-    ['ENERGY', Math.round(energy)],
-  ];
+  if (editable) {
+    const keys = ['attack', 'speed', 'size', 'sight', 'aggression', 'hp'];
+    const labels = ['ATTACK', 'SPEED', 'SIZE', 'SIGHT', 'AGGRO', 'HP'];
+    const rowH = s * 1.22;
+    const firstY = cardY + s * 1.7;
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const y = firstY + i * rowH;
+      const value =
+        key === 'hp'
+          ? `${Math.round(hp)}`
+          : key === 'speed'
+          ? Number(st.speed).toFixed(1)
+          : key === 'size'
+          ? Number(st.size).toFixed(2)
+          : String(Math.round(st[key]));
 
-  textSize(s * 0.62);
-  for (let i = 0; i < rows.length; i++) {
-    const y = cardY + 7 + s * 1.5 + i * s * 1.0;
-    fill(150, 200, 225, 190);
-    textAlign(LEFT, TOP);
-    text(rows[i][0], cardX + 10, y);
-    fill(240, 252, 255, 220);
-    textAlign(RIGHT, TOP);
-    text(String(rows[i][1]), cardX + cardW - 10, y);
+      fill(150, 200, 225, 190);
+      textAlign(LEFT, TOP);
+      textSize(s * 0.58);
+      text(labels[i], cardX + 10, y);
+
+      fill(240, 252, 255, 220);
+      textAlign(RIGHT, TOP);
+      text(value, cardX + cardW - s * 7.0, y);
+
+      const bw = s * 1.9;
+      const bh = s * 1.0;
+      const by = y - s * 0.12;
+      const minusX = cardX + cardW - s * 5.9;
+      const plusX = cardX + cardW - s * 3.3;
+
+      for (const [bx, label, dir] of [
+        [minusX, '−', -1],
+        [plusX, '+', 1],
+      ]) {
+        noFill();
+        stroke(140, 230, 255, 90);
+        strokeWeight(1);
+        rect(bx, by, bw, bh, bh / 2);
+        noStroke();
+        fill(150, 235, 255, 210);
+        textAlign(CENTER, CENTER);
+        textSize(s * 0.7);
+        text(label, bx + bw / 2, by + bh / 2 + 1);
+        devHits.push({ x: bx, y: by, w: bw, h: bh, key, dir });
+      }
+    }
+  } else {
+    const rows = [
+      ['ATTACK', st.attack],
+      ['SPEED', st.speed.toFixed(1)],
+      ['SIZE', st.size.toFixed(2)],
+      ['SIGHT', st.sight.toFixed(0)],
+      ['AGGRESSION', st.aggression],
+      ['ENERGY/DAY', need],
+      ['HP', `${Math.max(0, Math.round(hp))}/${MAX_HP}`],
+      ['ENERGY', Math.round(energy)],
+    ];
+
+    textSize(s * 0.62);
+    for (let i = 0; i < rows.length; i++) {
+      const y = cardY + 7 + s * 1.5 + i * s * 1.0;
+      fill(150, 200, 225, 190);
+      textAlign(LEFT, TOP);
+      text(rows[i][0], cardX + 10, y);
+      fill(240, 252, 255, 220);
+      textAlign(RIGHT, TOP);
+      text(String(rows[i][1]), cardX + cardW - 10, y);
+    }
   }
 
   fill(140, 190, 215, 150);
   textAlign(CENTER, TOP);
   textSize(s * 0.55);
-  text('CLICK TO CLOSE', cardX + cardW / 2, cardY + cardH - s * 1.4);
+  text(editable ? 'EDIT · CLICK TO CLOSE' : 'CLICK TO CLOSE', cardX + cardW / 2, cardY + cardH - s * 1.4);
 
   pop();
 }
@@ -663,6 +847,8 @@ function enterField() {
 // ---------------------------------------------------------------- behaviour
 
 function updateBehaviour(dt, sync = true) {
+  simClock += dt;
+
   for (const o of ottos) {
     if (o.dead) {
       o.death += dt;
@@ -861,20 +1047,65 @@ function chooseIntent(o) {
     }
   }
 
-  // Nearest food inside the sight radius.
+  // Commit to fleeing for a minimum time, and keep going while the threat is
+  // still inside 1.5× sight. This prevents flee/return thrashing at the edge.
+  if (o.mode === 'flee' && o.fleeThreat) {
+    const threatAlive = remote.has(o.fleeThreat.id) && o.fleeThreat.hp > 0;
+    if (threatAlive) {
+      o.threatX = o.fleeThreat.x;
+      o.threatY = o.fleeThreat.y;
+      o.threatAt = simClock;
+    }
+
+    const dThreat =
+      o.threatX == null || o.threatY == null
+        ? Infinity
+        : Math.hypot(o.threatX - o.pos.x, o.threatY - o.pos.y);
+    const stillClose = dThreat < st.sight * FLEE_SAFE_MULT;
+
+    if (simClock < o.fleeUntil || stillClose) {
+      o.mode = 'flee';
+      o.target = {
+        x: o.threatX == null ? o.pos.x : o.threatX,
+        y: o.threatY == null ? o.pos.y : o.threatY,
+      };
+      return;
+    }
+
+    o.fleeThreat = null;
+    o.fleeUntil = 0;
+  }
+
+  // Food: prefer pieces away from the last known threat position.
   let food = null;
   let foodD = Infinity;
+  let safeFood = null;
+  let safeFoodD = Infinity;
+  const threatRecent = o.threatX != null && simClock < o.threatAt + 6;
   const store = currentFood();
   if (store) {
     for (const id in store) {
       const f = store[id];
       if (!f || typeof f.x !== 'number') continue;
       const d = Math.hypot(f.x - o.pos.x, f.y - o.pos.y);
-      if (d <= st.sight && d < foodD) {
+      if (d > st.sight) continue;
+
+      if (d < foodD) {
         food = f;
         foodD = d;
       }
+      if (threatRecent) {
+        const td = Math.hypot(f.x - o.threatX, f.y - o.threatY);
+        if (td > st.sight * 0.9 && d < safeFoodD) {
+          safeFood = f;
+          safeFoodD = d;
+        }
+      }
     }
+  }
+  if (threatRecent && safeFood) {
+    food = safeFood;
+    foodD = safeFoodD;
   }
 
   // Aggression against the other Otto's Size decides fight or flight.
@@ -884,6 +1115,11 @@ function chooseIntent(o) {
 
   if (scared) {
     o.mode = 'flee';
+    o.fleeThreat = enemy;
+    o.fleeUntil = simClock + FLEE_MIN_TIME;
+    o.threatX = enemy.x;
+    o.threatY = enemy.y;
+    o.threatAt = simClock;
     o.target = { x: enemy.x, y: enemy.y };
     return;
   }
@@ -912,11 +1148,74 @@ function chooseIntent(o) {
     !o.wander ||
     Math.hypot(o.wander.x - o.pos.x, o.wander.y - o.pos.y) < 1.5
   ) {
-    const a = Math.random() * Math.PI * 2;
-    const r = 1 + Math.random() * Math.min(8, fieldLimit(st.size) * 0.6);
-    o.wander = { x: Math.cos(a) * r, y: Math.sin(a) * r };
+    if (threatRecent) {
+      const away = Math.atan2(o.pos.y - o.threatY, o.pos.x - o.threatX);
+      const a = away + (Math.random() * 2 - 1) * Math.PI * 0.45;
+      const r = 2 + Math.random() * Math.min(6, fieldLimit(st.size) * 0.5);
+      o.wander = {
+        x: o.pos.x + Math.cos(a) * r,
+        y: o.pos.y + Math.sin(a) * r,
+      };
+    } else {
+      const a = Math.random() * Math.PI * 2;
+      const r = 1 + Math.random() * Math.min(8, fieldLimit(st.size) * 0.6);
+      o.wander = { x: Math.cos(a) * r, y: Math.sin(a) * r };
+    }
   }
   o.target = o.wander;
+}
+
+// Bend the desired direction around friendly Ottos. The separation pass is
+// still kept as a last-resort overlap fix.
+function applyFriendlySteering(o, ux, uy) {
+  let rx = 0;
+  let ry = 0;
+
+  for (const b of ottos) {
+    if (b === o || b.dead) continue;
+
+    const dx = o.pos.x - b.pos.x;
+    const dy = o.pos.y - b.pos.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 0.001) continue;
+
+    const personal =
+      FRIEND_SPACE * (ottoHalfWidth(o.stats.size) + ottoHalfWidth(b.stats.size));
+
+    // Soft repulsion inside the personal space.
+    if (d < personal) {
+      const w = (personal - d) / personal;
+      rx += (dx / d) * w;
+      ry += (dy / d) * w;
+    }
+
+    // If the friend is directly ahead, add a sideways component to walk around.
+    const relX = b.pos.x - o.pos.x;
+    const relY = b.pos.y - o.pos.y;
+    const along = relX * ux + relY * uy;
+    const leftX = -uy;
+    const leftY = ux;
+    const perp = relX * leftX + relY * leftY;
+    const sep = Math.hypot(relX, relY);
+    const front = personal * 1.8;
+    if (along > 0 && sep < front && Math.abs(perp) < personal * 0.9) {
+      let side = perp > 0 ? -1 : 1;
+      if (Math.abs(perp) < 0.001) side = o.id % 2 ? -1 : 1;
+      const w =
+        (1 - Math.abs(perp) / (personal * 0.9)) * (1 - sep / front);
+      rx += leftX * side * w * 1.1;
+      ry += leftY * side * w * 1.1;
+    }
+  }
+
+  let sx = ux + rx * FRIEND_STEER;
+  let sy = uy + ry * FRIEND_STEER;
+  const len = Math.hypot(sx, sy);
+  if (len > 0.001) {
+    sx /= len;
+    sy /= len;
+  }
+  return { x: sx, y: sy };
 }
 
 function moveOtto(o, dt) {
@@ -944,10 +1243,13 @@ function moveOtto(o, dt) {
   const dy = ty - o.pos.y;
   const d = Math.hypot(dx, dy);
   if (d > 0.06) {
+    const ux = dx / d;
+    const uy = dy / d;
+    const steer = applyFriendlySteering(o, ux, uy);
     const step = Math.min(d, speed * dt);
-    o.pos.x += (dx / d) * step;
-    o.pos.y += (dy / d) * step;
-    o.facing = dx >= 0 ? 1 : -1;
+    o.pos.x += steer.x * step;
+    o.pos.y += steer.y * step;
+    o.facing = steer.x >= 0 ? 1 : -1;
     o.moving = true;
   }
 
@@ -1000,9 +1302,15 @@ function fightIfTouching(o) {
   if (d > standoff + 0.05) return;
 
   o.fightCd = FIGHT_COOLDOWN;
-  const win = o.stats.attack >= foe.attack;
-  const bite = Math.max(2, foe.attack * 0.6);
-  o.hp = Math.max(0, o.hp - (win ? bite * 0.4 : bite));
+
+  // Direct damage: the attacker's Attack stat is subtracted from HP.
+  o.hp = Math.max(0, o.hp - Math.max(1, foe.attack));
+
+  // Dev enemies have no phone to apply damage to them, so take it here.
+  if (foe.dev) {
+    foe.hp = Math.max(0, foe.hp - Math.max(1, o.stats.attack));
+    if (foe.hp <= 0) foe.deadTime = 0;
+  }
 
   // Resolve to the standoff edge plus a small knockback. Both phones run the
   // same comparison from the broadcast stats, so both back out to their side.
@@ -1213,6 +1521,22 @@ function updateRemote(dt) {
   }
 
   for (const [id, r] of remote) {
+    if (r.dev) {
+      r.lock = 1;
+      if (r.hp <= 0) {
+        r.deadTime += dt;
+        if (!r.credited) {
+          r.credited = true;
+          awardKill(r);
+        }
+        if (r.deadTime >= DEATH_LINGER) remote.delete(id);
+      } else {
+        r.deadTime = 0;
+        r.credited = false;
+      }
+      continue;
+    }
+
     if (!seen.has(id)) {
       r.lock -= dt * 3;
       if (r.lock <= 0) remote.delete(id);
@@ -1352,7 +1676,9 @@ function colonyColorMap() {
   if (typeof guests !== 'undefined' && Array.isArray(guests)) {
     for (const g of guests) if (g && g.id) ids.add(g.id);
   }
-  for (const r of remote.values()) if (r.client) ids.add(r.client);
+  for (const r of remote.values()) {
+    if (r.client && !r.dev) ids.add(r.client);
+  }
 
   const sorted = [...ids].sort();
   const map = new Map();
@@ -1544,7 +1870,7 @@ function drawColonyRings() {
     const p = fieldToScreen(r.x, r.y);
     const h = OTTO_UNITS_TALL * r.size * field.px;
     const w = h * (OTTO_CROP.w / OTTO_CROP.h);
-    drawColonyRing(ctx, p.x, p.y, w, h, alpha, colonyColorFor(r.client));
+    drawColonyRing(ctx, p.x, p.y, w, h, alpha, r.dev ? r.color : colonyColorFor(r.client));
   }
 }
 
@@ -1576,6 +1902,7 @@ function drawRemoteOttos() {
   const sceneAlpha = 1 - examineT * 0.75;
   for (const r of remote.values()) {
     if (r.lock <= 0.01) continue;
+    if (r === examineRef) continue;
     const fade =
       r.hp <= 0 ? Math.max(0, 1 - (r.deadTime || 0) / DEATH_LINGER) : 1;
     const alpha = r.lock * fade * sceneAlpha;
@@ -1589,7 +1916,7 @@ function drawRemoteOttos() {
       r.facing,
       0,
       r.hp / MAX_HP,
-      colonyColorFor(r.client)
+      r.dev ? r.color : colonyColorFor(r.client)
     );
   }
 }
@@ -1864,6 +2191,8 @@ function drawHud() {
   pauseHit = null;
   autoHit = null;
   timeHit = null;
+  devHit = null;
+  spawnHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 7.45;
   const label = found ? 'LOCKED' : 'SEEKING';
@@ -1953,6 +2282,40 @@ function drawHud() {
     fill(shownScale > 1 ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
     textAlign(CENTER, CENTER);
     text(timeLabel, tx + tw / 2, ty + chipH / 2 + 1);
+  }
+
+  // Dev mode (solo only): spawn and edit enemy Ottos.
+  if (!shareConnected && !panel.open) {
+    const dy = chipY + chipH + 8;
+    const devLabel = devMode ? 'DEV ON' : 'DEV OFF';
+    textSize(s * 0.58);
+    const dw = textWidth(devLabel) + 22;
+    devHit = { x: 18, y: dy, w: dw, h: chipH };
+
+    noFill();
+    stroke(devMode ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
+    strokeWeight(1);
+    rect(18, dy, dw, chipH, chipH / 2);
+    noStroke();
+    fill(devMode ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
+    textAlign(CENTER, CENTER);
+    text(devLabel, 18 + dw / 2, dy + chipH / 2 + 1);
+
+    if (devMode) {
+      const spawnLabel = '+ SPAWN ENEMY';
+      textSize(s * 0.58);
+      const sw = textWidth(spawnLabel) + 24;
+      spawnHit = { x: 18 + dw + 10, y: dy, w: sw, h: chipH };
+
+      noFill();
+      stroke(126, 255, 190, 140);
+      strokeWeight(1);
+      rect(spawnHit.x, dy, sw, chipH, chipH / 2);
+      noStroke();
+      fill(126, 255, 190, 220);
+      textAlign(CENTER, CENTER);
+      text(spawnLabel, spawnHit.x + sw / 2, dy + chipH / 2 + 1);
+    }
   }
 
   // Join button, drawn only while the room is not connected.
@@ -2156,8 +2519,16 @@ function castLocalYes() {
 }
 
 function mousePressed() {
-  // Any click while an Otto is being examined closes the view.
+  // While examining, dev buttons edit stats; any other click closes the view.
   if (examineClone) {
+    if (devMode && !shareConnected) {
+      for (const h of devHits) {
+        if (hitRect(h, mouseX, mouseY)) {
+          adjustDevStat(h.key, h.dir);
+          return false;
+        }
+      }
+    }
     dismissExamine();
     return false;
   }
@@ -2198,6 +2569,16 @@ function mousePressed() {
     return false;
   }
 
+  if (hitRect(devHit, mouseX, mouseY)) {
+    if (!shareConnected) devMode = !devMode;
+    return false;
+  }
+
+  if (hitRect(spawnHit, mouseX, mouseY)) {
+    if (!shareConnected && devMode) spawnDevEnemy();
+    return false;
+  }
+
   if (hitRect(autoHit, mouseX, mouseY)) {
     autoSkipDay = !autoSkipDay;
     if (autoSkipDay && paused) {
@@ -2227,6 +2608,16 @@ function mousePressed() {
       if (ottoHit(o, mouseX, mouseY)) {
         startExamine(o);
         return false;
+      }
+    }
+
+    if (devMode && !shareConnected) {
+      for (const r of remote.values()) {
+        if (!r.dev || r.hp <= 0) continue;
+        if (devOttoHit(r, mouseX, mouseY)) {
+          startExamine(r, 'dev');
+          return false;
+        }
       }
     }
   }
