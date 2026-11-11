@@ -25,6 +25,7 @@ const FIELD_UNITS_ACROSS = 4;
 const FIELD_TILT = 0.55; // vertical squash, so the field reads as a tabletop plane
 const FIELD_RADIUS = 22; // Ottos stay inside this radius, and inside the screen
 const OTTO_UNITS_TALL = 3.2;
+const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
 const EAT_RADIUS = 1.3;
 const CONTACT_RADIUS = 1.9;
 const FLEE_RANGE = 12;
@@ -34,18 +35,27 @@ const FOOD_AMOUNT = 10;
 const FOOD_MAX = 6;
 const FOOD_RADIUS = 0.45;
 const SPAWN_EVERY = 5;
-const DAY_SECONDS = 240; // a whole EnergyRequirement burns over this many seconds
+const DAY_SECONDS = 240; // one day: food is tallied and reproduction is checked
+
+// An Otto burns ENERGY_PER_SIZE × its Size every day. The requirement is
+// derived from Size alone, so no editor or inheritance path can change it.
+const ENERGY_PER_SIZE = 50;
+const ENERGY_STORE_MULT = 2; // two days of food starts a child at day's end
+const MAX_OTTOS = 12;
+const MUTATE = 0.2; // child stat spread, ±20%
+const MUTATE_SIZE = 0.15; // Size mutates a little more gently
 
 const FIGHT_COOLDOWN = 1.1;
 
-const STAT_ROWS = [
-  { key: 'attack', label: 'ATTACK', min: 1, max: 30, step: 1 },
-  { key: 'speed', label: 'SPEED', min: 0.5, max: 8, step: 0.1 },
-  { key: 'size', label: 'SIZE', min: 0.4, max: 2.5, step: 0.05 },
-  { key: 'sight', label: 'SIGHT', min: 2, max: 20, step: 1 },
-  { key: 'aggression', label: 'AGGRESSION', min: 0, max: 30, step: 1 },
-  { key: 'energyRequirement', label: 'ENERGY/DAY', min: 10, max: 120, step: 5 },
-];
+const STAT_DEFS = {
+  attack: { label: 'ATTACK', min: 1, max: 30, step: 1 },
+  speed: { label: 'SPEED', min: 0.5, max: 8, step: 0.1 },
+  size: { label: 'SIZE', min: 0.4, max: 2.5, step: 0.05 },
+  sight: { label: 'SIGHT', min: 2, max: 20, step: 1 },
+  aggression: { label: 'AGGRESSION', min: 0, max: 30, step: 1 },
+};
+const STAT_KEYS = Object.keys(STAT_DEFS);
+const STAT_ROWS = STAT_KEYS.map((key) => ({ key, ...STAT_DEFS[key] }));
 
 const MODE_LABEL = {
   wander: 'WANDERING',
@@ -61,12 +71,18 @@ let visited;
 let stack;
 
 let marker;
-let otto;
+let ottos = [];
 let ottoGif;
 let field;
 let remote = new Map();
 let localFood = {};
 let foodSpawnTimer = 0;
+
+let fieldEntered = false;
+let fieldLock = 0;
+let markerLost = 0;
+let dayClock = 0;
+let dayNumber = 1;
 
 let lastMillis = 0;
 let scanTick = 0;
@@ -82,7 +98,7 @@ async function setup() {
   lockGestures();
   textFont('monospace');
 
-  // Shared room for the class session. `me.otto` is this phone's creature;
+  // Shared room for the class session. `me.ottos` is this phone's colony;
   // the other phones see it in `guests`. Food lives in `shared.food`.
   shareSetup({
     host: SHARE_HOST,
@@ -91,7 +107,7 @@ async function setup() {
     shared: { food: {} },
     me: {
       name: 'Otto',
-      otto: { x: 0, y: 0, size: 1, attack: 10, aggression: 10, sight: 8 },
+      ottos: [],
     },
   });
 
@@ -122,6 +138,7 @@ async function setup() {
 function shareReady() {
   // Keep the shared schema stable even if another client created the room.
   if (!shared.food || typeof shared.food !== 'object') shared.food = {};
+  if (window.me && !Array.isArray(me.ottos)) me.ottos = [];
   remote.clear();
   foodSpawnTimer = 0;
   if (shareIsHost) seedFood(shared.food, 3);
@@ -133,30 +150,67 @@ function resetTracking() {
   localFood = {};
   foodSpawnTimer = 0;
 
-  otto = {
-    has: false,
-    lock: 0,
-    lost: 0,
-    pos: { x: 0, y: 0 },
+  ottos = [createOtto(defaultStats(), 0, 0)];
+  fieldEntered = false;
+  fieldLock = 0;
+  markerLost = 0;
+  dayClock = 0;
+  dayNumber = 1;
+}
+
+function defaultStats() {
+  return {
+    attack: 10,
+    speed: 2.5,
+    size: 1,
+    sight: 8,
+    aggression: 10,
+  };
+}
+
+// Daily energy cost is a pure function of Size, so it cannot be edited or
+// passed down directly. Every other system asks for it here.
+function energyRequirementFor(size) {
+  return Math.max(5, Math.round(ENERGY_PER_SIZE * size));
+}
+
+function createOtto(stats, x, y) {
+  const st = stats || defaultStats();
+  return {
+    pos: { x: x || 0, y: y || 0 },
     facing: 1,
     moving: false,
     pop: 0,
+    spawn: 1,
     mode: 'wander',
     target: null,
     wander: null,
     think: 0,
     fightCd: 0,
-    energy: 50,
-    stats: {
-      attack: 10,
-      speed: 2.5,
-      size: 1,
-      sight: 8,
-      aggression: 10,
-      energyRequirement: 50,
-    },
+    energy: 0, // food eaten so far today; every Otto starts the day empty
+    stats: st,
   };
-  otto.energy = otto.stats.energyRequirement * 0.55;
+}
+
+// A child copies its parent with a small independent wobble on every stat.
+function mutateStats(parent) {
+  const out = {};
+  for (const key of STAT_KEYS) {
+    const def = STAT_DEFS[key];
+    const spread = key === 'size' ? MUTATE_SIZE : MUTATE;
+    const factor = 1 + (Math.random() * 2 - 1) * spread;
+    let v = parent[key] * factor;
+    v = def.min + Math.round((v - def.min) / def.step) * def.step;
+    v = Math.round(v * 1000) / 1000;
+    out[key] = constrain(v, def.min, def.max);
+  }
+  return out;
+}
+
+function maxOttoSize() {
+  let m = 1;
+  for (const o of ottos) m = Math.max(m, o.stats.size);
+  return m;
 }
 
 function draw() {
@@ -187,25 +241,22 @@ function draw() {
   updateRemote(dt);
   updateFood(dt);
 
-  if (marker.found && !otto.has) enterField();
+  if (marker.found && !fieldEntered) enterField();
 
   if (marker.found) {
-    otto.lost = 0;
-    otto.lock += (1 - otto.lock) * (1 - Math.exp(-dt / 0.12));
+    markerLost = 0;
+    fieldLock += (1 - fieldLock) * (1 - Math.exp(-dt / 0.12));
   } else {
-    otto.lost += dt;
-    if (otto.lost > 0.12) otto.lock *= Math.exp(-dt / 0.18);
+    markerLost += dt;
+    if (markerLost > 0.12) fieldLock *= Math.exp(-dt / 0.18);
   }
 
-  if (otto.has && field.ok) {
-    updateBehaviour(dt);
-    otto.pop *= Math.exp(-dt / 0.18);
-  }
+  if (fieldEntered && field.ok) updateBehaviour(dt);
 
   drawFood();
   if (showField) drawFieldDebug();
   drawRemoteOttos();
-  drawLocalOtto();
+  drawLocalOttos();
   drawHud();
   if (panel.open) drawPanel();
 }
@@ -344,12 +395,13 @@ function updateField(dt) {
   field.px = lerp(field.px, field.tpx, ks);
 }
 
-// How far the Otto may roam before it would leave the camera view. The marker
+// How far an Otto may roam before it would leave the camera view. The marker
 // is rarely centred, so this shrinks towards the nearest screen edge.
-function fieldLimit() {
-  if (!field || !field.ok || !otto) return 3;
+function fieldLimit(size) {
+  if (!field || !field.ok) return 3;
+  const tall = typeof size === 'number' ? size : 1;
   const pxy = field.px * FIELD_TILT;
-  const sprite = OTTO_UNITS_TALL * otto.stats.size * field.px;
+  const sprite = OTTO_UNITS_TALL * tall * field.px;
   const acrossX = Math.min(field.x, width - field.x) / field.px;
   const down = (height - field.y) / pxy;
   const up = (field.y - sprite) / pxy;
@@ -365,59 +417,166 @@ function fieldToScreen(fx, fy) {
 }
 
 function enterField() {
-  otto.has = true;
-  otto.lock = 0;
-  otto.pos.x = 0;
-  otto.pos.y = 0;
-  otto.energy = otto.stats.energyRequirement * 0.55;
-  otto.mode = 'wander';
-  otto.target = null;
-  otto.wander = null;
-  otto.think = 0;
-  otto.fightCd = 0;
+  fieldEntered = true;
+  fieldLock = 0;
+  dayClock = 0;
+  if (ottos.length) {
+    const first = ottos[0];
+    first.pos.x = 0;
+    first.pos.y = 0;
+    first.mode = 'wander';
+    first.target = null;
+    first.wander = null;
+    first.think = 0;
+    first.fightCd = 0;
+  }
 }
 
 // ---------------------------------------------------------------- behaviour
 
 function updateBehaviour(dt) {
-  const st = otto.stats;
+  for (const o of ottos) {
+    const st = o.stats;
 
-  otto.fightCd = Math.max(0, otto.fightCd - dt);
-  otto.energy = Math.max(
-    0,
-    otto.energy - (st.energyRequirement / DAY_SECONDS) * dt
-  );
+    o.fightCd = Math.max(0, o.fightCd - dt);
+    o.spawn = Math.min(1, o.spawn + dt / 0.5);
+    o.pop *= Math.exp(-dt / 0.18);
 
-  const store = currentFood();
-  if (store) eatNearby(store);
+    const store = currentFood();
+    if (store) eatNearby(o, store);
 
-  otto.think -= dt;
-  if (otto.think <= 0) {
-    otto.think = 0.25;
-    chooseIntent();
+    o.think -= dt;
+    if (o.think <= 0) {
+      o.think = 0.25;
+      chooseIntent(o);
+    }
+
+    moveOtto(o, dt);
+
+    // Keep the Otto on the tabletop and inside the camera view.
+    const limit = fieldLimit(st.size);
+    const d = Math.hypot(o.pos.x, o.pos.y);
+    if (d > limit) {
+      o.pos.x = (o.pos.x / d) * limit;
+      o.pos.y = (o.pos.y / d) * limit;
+    }
   }
 
-  moveOtto(dt);
-
-  // Keep the Otto on the tabletop and inside the camera view.
-  const limit = fieldLimit();
-  const d = Math.hypot(otto.pos.x, otto.pos.y);
-  if (d > limit) {
-    otto.pos.x = (otto.pos.x / d) * limit;
-    otto.pos.y = (otto.pos.y / d) * limit;
+  dayClock += dt;
+  if (dayClock >= DAY_SECONDS) {
+    dayClock = 0;
+    endOfDay();
   }
 
   syncMe();
 }
 
-function chooseIntent() {
-  const st = otto.stats;
+// Reproduction is checked once, when the day's food is tallied. Every Otto
+// then starts the next day empty, including the new children.
+function endOfDay() {
+  const parents = [];
+  for (const o of ottos) {
+    if (o.energy >= energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT) {
+      parents.push(o);
+    }
+  }
+
+  const before = ottos.length;
+  for (const parent of parents) reproduce(parent);
+
+  for (const o of ottos) o.energy = 0;
+
+  if (ottos.length > before) {
+    separateOttos();
+    for (const o of ottos) {
+      o.think = 0;
+      o.target = null;
+      o.wander = null;
+    }
+  }
+
+  dayNumber += 1;
+}
+
+// The child inherits a mutated genome but starts the new day with no food.
+function reproduce(parent) {
+  if (ottos.length >= MAX_OTTOS) return;
+  const need = energyRequirementFor(parent.stats.size);
+  if (parent.energy < need * ENERGY_STORE_MULT) return;
+
+  const stats = mutateStats(parent.stats);
+  const a = Math.random() * Math.PI * 2;
+  const d = 1.1 + Math.random() * 0.7;
+  const child = createOtto(
+    stats,
+    parent.pos.x + Math.cos(a) * d,
+    parent.pos.y + Math.sin(a) * d
+  );
+  child.spawn = 0;
+  child.facing = parent.facing;
+  child.pop = 1;
+  parent.pop = 1;
+  ottos.push(child);
+}
+
+// Sprites are nearly three field units wide, so a newborn at the parent's
+// feet would be hidden behind it. Push overlapping pairs apart after births.
+function separateOttos(rounds = 6) {
+  for (let r = 0; r < rounds; r++) {
+    let moved = false;
+
+    for (let i = 0; i < ottos.length; i++) {
+      for (let j = i + 1; j < ottos.length; j++) {
+        const a = ottos[i];
+        const b = ottos[j];
+        const dx = b.pos.x - a.pos.x;
+        const dy = b.pos.y - a.pos.y;
+        const min = OTTO_SPACING * (a.stats.size + b.stats.size);
+        const d = Math.hypot(dx, dy);
+        if (d >= min) continue;
+
+        let nx;
+        let ny;
+        if (d < 0.001) {
+          const angle = Math.random() * Math.PI * 2;
+          nx = Math.cos(angle);
+          ny = Math.sin(angle);
+        } else {
+          nx = dx / d;
+          ny = dy / d;
+        }
+
+        const push = (min - d) / 2 + 0.02;
+        a.pos.x -= nx * push;
+        a.pos.y -= ny * push;
+        b.pos.x += nx * push;
+        b.pos.y += ny * push;
+        moved = true;
+      }
+    }
+
+    for (const o of ottos) {
+      const limit = fieldLimit(o.stats.size);
+      const d = Math.hypot(o.pos.x, o.pos.y);
+      if (d > limit) {
+        o.pos.x = (o.pos.x / d) * limit;
+        o.pos.y = (o.pos.y / d) * limit;
+      }
+    }
+
+    if (!moved) break;
+  }
+}
+
+function chooseIntent(o) {
+  const st = o.stats;
+  const need = energyRequirementFor(st.size);
 
   // Nearest other Otto inside the sight radius.
   let enemy = null;
   let enemyD = Infinity;
   for (const r of remote.values()) {
-    const d = Math.hypot(r.x - otto.pos.x, r.y - otto.pos.y);
+    const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
     if (d <= st.sight + r.size * 0.6 && d < enemyD) {
       enemy = r;
       enemyD = d;
@@ -432,7 +591,7 @@ function chooseIntent() {
     for (const id in store) {
       const f = store[id];
       if (!f || typeof f.x !== 'number') continue;
-      const d = Math.hypot(f.x - otto.pos.x, f.y - otto.pos.y);
+      const d = Math.hypot(f.x - o.pos.x, f.y - o.pos.y);
       if (d <= st.sight && d < foodD) {
         food = f;
         foodD = d;
@@ -442,112 +601,117 @@ function chooseIntent() {
 
   // Aggression against the other Otto's Size decides fight or flight.
   const scared = enemy && st.aggression < enemy.size * 10;
-  const hungry = otto.energy < st.energyRequirement * 0.98;
+  const hungry = o.energy < need;
+  const wantsSurplus = o.energy < need * ENERGY_STORE_MULT;
 
   if (scared) {
-    otto.mode = 'flee';
-    otto.target = { x: enemy.x, y: enemy.y };
+    o.mode = 'flee';
+    o.target = { x: enemy.x, y: enemy.y };
     return;
   }
 
   if (food && hungry) {
-    otto.mode = 'eat';
-    otto.target = { x: food.x, y: food.y };
+    o.mode = 'eat';
+    o.target = { x: food.x, y: food.y };
     return;
   }
 
   if (enemy) {
-    otto.mode = 'hunt';
-    otto.target = { x: enemy.x, y: enemy.y, foe: enemy };
+    o.mode = 'hunt';
+    o.target = { x: enemy.x, y: enemy.y, foe: enemy };
     return;
   }
 
-  otto.mode = 'wander';
+  // Fed for the day but not yet ready to reproduce: keep grazing if it can.
+  if (food && wantsSurplus) {
+    o.mode = 'eat';
+    o.target = { x: food.x, y: food.y };
+    return;
+  }
+
+  o.mode = 'wander';
   if (
-    !otto.wander ||
-    Math.hypot(otto.wander.x - otto.pos.x, otto.wander.y - otto.pos.y) < 1.5
+    !o.wander ||
+    Math.hypot(o.wander.x - o.pos.x, o.wander.y - o.pos.y) < 1.5
   ) {
     const a = Math.random() * Math.PI * 2;
-    const r = 1 + Math.random() * Math.min(8, fieldLimit() * 0.6);
-    otto.wander = { x: Math.cos(a) * r, y: Math.sin(a) * r };
+    const r = 1 + Math.random() * Math.min(8, fieldLimit(st.size) * 0.6);
+    o.wander = { x: Math.cos(a) * r, y: Math.sin(a) * r };
   }
-  otto.target = otto.wander;
+  o.target = o.wander;
 }
 
-function moveOtto(dt) {
-  const st = otto.stats;
-  const t = otto.target;
-  otto.moving = false;
+function moveOtto(o, dt) {
+  const st = o.stats;
+  const t = o.target;
+  o.moving = false;
   if (!t) return;
 
   let tx = t.x;
   let ty = t.y;
-  let speed = st.speed * (otto.energy <= 0 ? 0.45 : 1);
+  let speed = st.speed * (o.energy <= 0 ? 0.45 : 1);
 
-  if (otto.mode === 'flee') {
-    const dx = otto.pos.x - t.x;
-    const dy = otto.pos.y - t.y;
+  if (o.mode === 'flee') {
+    const dx = o.pos.x - t.x;
+    const dy = o.pos.y - t.y;
     const d = Math.hypot(dx, dy) || 1;
-    tx = otto.pos.x + (dx / d) * FLEE_RANGE;
-    ty = otto.pos.y + (dy / d) * FLEE_RANGE;
+    tx = o.pos.x + (dx / d) * FLEE_RANGE;
+    ty = o.pos.y + (dy / d) * FLEE_RANGE;
     speed *= 1.2;
-  } else if (otto.mode === 'wander') {
+  } else if (o.mode === 'wander') {
     speed *= 0.45;
   }
 
-  const dx = tx - otto.pos.x;
-  const dy = ty - otto.pos.y;
+  const dx = tx - o.pos.x;
+  const dy = ty - o.pos.y;
   const d = Math.hypot(dx, dy);
   if (d > 0.06) {
     const step = Math.min(d, speed * dt);
-    otto.pos.x += (dx / d) * step;
-    otto.pos.y += (dy / d) * step;
-    otto.facing = dx >= 0 ? 1 : -1;
-    otto.moving = true;
+    o.pos.x += (dx / d) * step;
+    o.pos.y += (dy / d) * step;
+    o.facing = dx >= 0 ? 1 : -1;
+    o.moving = true;
   }
 
-  if (otto.mode === 'hunt') fightIfTouching();
+  if (o.mode === 'hunt') fightIfTouching(o);
 }
 
-function fightIfTouching() {
-  if (otto.fightCd > 0) return;
-  const foe = otto.target && otto.target.foe;
+function fightIfTouching(o) {
+  if (o.fightCd > 0) return;
+  const foe = o.target && o.target.foe;
   if (!foe || !remote.has(foe.id)) return;
 
-  const d = Math.hypot(foe.x - otto.pos.x, foe.y - otto.pos.y);
+  const d = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
   if (d > CONTACT_RADIUS + foe.size * 0.4) return;
 
-  otto.fightCd = FIGHT_COOLDOWN;
-  const win = otto.stats.attack >= foe.attack;
+  o.fightCd = FIGHT_COOLDOWN;
+  const win = o.stats.attack >= foe.attack;
   const bite = Math.max(2, foe.attack * 0.6);
-  otto.energy = Math.max(0, otto.energy - (win ? bite * 0.4 : bite));
+  o.energy = Math.max(0, o.energy - (win ? bite * 0.4 : bite));
 
   // Bounce apart. The other phone runs the same comparison from the same
   // broadcast stats, so both creatures see the same result.
-  const nx = otto.pos.x - foe.x || 0.001;
-  const ny = otto.pos.y - foe.y || 0.001;
+  const nx = o.pos.x - foe.x || 0.001;
+  const ny = o.pos.y - foe.y || 0.001;
   const n = Math.hypot(nx, ny);
-  otto.pos.x += (nx / n) * 2.4;
-  otto.pos.y += (ny / n) * 2.4;
-  otto.pop = 1;
-  otto.wander = null;
+  o.pos.x += (nx / n) * 2.4;
+  o.pos.y += (ny / n) * 2.4;
+  o.pop = 1;
+  o.wander = null;
 }
 
-function eatNearby(store) {
-  const full = otto.stats.energyRequirement;
-  if (otto.energy >= full) return;
+function eatNearby(o, store) {
+  const max = energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT;
+  if (o.energy >= max) return;
 
   for (const id in store) {
     const f = store[id];
     if (!f || typeof f.x !== 'number') continue;
-    if (Math.hypot(f.x - otto.pos.x, f.y - otto.pos.y) > EAT_RADIUS) continue;
+    if (Math.hypot(f.x - o.pos.x, f.y - o.pos.y) > EAT_RADIUS) continue;
 
-    otto.energy = Math.min(
-      full,
-      otto.energy + (Number(f.amount) || FOOD_AMOUNT)
-    );
+    o.energy = Math.min(max, o.energy + (Number(f.amount) || FOOD_AMOUNT));
     delete store[id];
-    otto.pop = 1;
+    o.pop = 1;
     return;
   }
 }
@@ -577,7 +741,7 @@ function seedFood(store, howMany) {
   let count = Object.keys(store).length;
   for (let i = 0; i < howMany && count < FOOD_MAX; i++, count++) {
     const a = Math.random() * Math.PI * 2;
-    const reach = Math.min(FIELD_RADIUS * 0.75, fieldLimit() * 0.75);
+    const reach = Math.min(FIELD_RADIUS * 0.75, fieldLimit(maxOttoSize()) * 0.75);
     const r = 1.5 + Math.random() * reach;
     store['f' + Math.floor(Math.random() * 1e9)] = {
       x: Math.round(Math.cos(a) * r * 100) / 100,
@@ -591,13 +755,22 @@ function seedFood(store, howMany) {
 
 function syncMe() {
   if (!window.me) return;
-  const o = me.otto || (me.otto = {});
-  o.x = Math.round(otto.pos.x * 100) / 100;
-  o.y = Math.round(otto.pos.y * 100) / 100;
-  o.size = Math.round(otto.stats.size * 100) / 100;
-  o.attack = otto.stats.attack;
-  o.aggression = otto.stats.aggression;
-  o.sight = otto.stats.sight;
+
+  // p5-phone clones object values when they are assigned, so build the whole
+  // colony as plain data and hand it over in one patch. Nested mutation of a
+  // newly assigned object would be lost.
+  const list = [];
+  for (const o of ottos) {
+    list.push({
+      x: Math.round(o.pos.x * 100) / 100,
+      y: Math.round(o.pos.y * 100) / 100,
+      size: Math.round(o.stats.size * 100) / 100,
+      attack: o.stats.attack,
+      aggression: o.stats.aggression,
+      sight: o.stats.sight,
+    });
+  }
+  me.ottos = list;
 }
 
 function updateRemote(dt) {
@@ -606,37 +779,46 @@ function updateRemote(dt) {
   if (shareConnected && Array.isArray(guests)) {
     for (let i = 0; i < guests.length; i++) {
       const g = guests[i];
-      const data = g && g.otto;
-      if (!data || typeof data.x !== 'number') continue;
+      if (!g) continue;
 
-      const id = g.id || 'guest-' + i;
-      seen.add(id);
+      // Every phone broadcasts a colony. Older clients sent a single `otto`,
+      // so accept that shape too and render it as a one-member group.
+      const list = Array.isArray(g.ottos) ? g.ottos : g.otto ? [g.otto] : [];
+      const base = g.id || 'guest-' + i;
 
-      let r = remote.get(id);
-      if (!r) {
-        r = {
-          id,
-          x: data.x,
-          y: data.y,
-          tx: data.x,
-          ty: data.y,
-          size: 1,
-          attack: 10,
-          aggression: 10,
-          sight: 8,
-          facing: 1,
-          lock: 0,
-        };
-        remote.set(id, r);
+      for (let j = 0; j < list.length; j++) {
+        const data = list[j];
+        if (!data || typeof data.x !== 'number') continue;
+
+        const id = base + '#' + j;
+        seen.add(id);
+
+        let r = remote.get(id);
+        if (!r) {
+          r = {
+            id,
+            x: data.x,
+            y: data.y,
+            tx: data.x,
+            ty: data.y,
+            size: 1,
+            attack: 10,
+            aggression: 10,
+            sight: 8,
+            facing: 1,
+            lock: 0,
+          };
+          remote.set(id, r);
+        }
+
+        r.tx = data.x;
+        r.ty = data.y;
+        r.size = numberOr(data.size, 1);
+        r.attack = numberOr(data.attack, 10);
+        r.aggression = numberOr(data.aggression, 10);
+        r.sight = numberOr(data.sight, 8);
+        if (Math.abs(r.tx - r.x) > 0.02) r.facing = r.tx >= r.x ? 1 : -1;
       }
-
-      r.tx = data.x;
-      r.ty = data.y;
-      r.size = numberOr(data.size, 1);
-      r.attack = numberOr(data.attack, 10);
-      r.aggression = numberOr(data.aggression, 10);
-      r.sight = numberOr(data.sight, 8);
-      if (Math.abs(r.tx - r.x) > 0.02) r.facing = r.tx >= r.x ? 1 : -1;
     }
   }
 
@@ -677,10 +859,12 @@ function drawWaiting(now) {
   );
 }
 
-function drawLocalOtto() {
-  if (!otto.has || otto.lock < 0.01 || !ottoGif || !field.ok) return;
-  const p = fieldToScreen(otto.pos.x, otto.pos.y);
-  drawOttoAt(p.x, p.y, otto.stats.size, otto.lock, otto.facing, otto.pop);
+function drawLocalOttos() {
+  if (!ottoGif || !field.ok || fieldLock < 0.01) return;
+  for (const o of ottos) {
+    const p = fieldToScreen(o.pos.x, o.pos.y);
+    drawOttoAt(p.x, p.y, o.stats.size, fieldLock * o.spawn, o.facing, o.pop);
+  }
 }
 
 function drawRemoteOttos() {
@@ -746,8 +930,7 @@ function drawFieldDebug() {
   if (!field.ok) return;
 
   const ctx = drawingContext;
-  const lim = fieldLimit();
-  const st = otto.stats;
+  const lim = fieldLimit(maxOttoSize());
 
   ctx.save();
   ctx.strokeStyle = 'rgba(126, 255, 190, 0.14)';
@@ -768,18 +951,20 @@ function drawFieldDebug() {
     ctx.stroke();
   }
 
-  const p = fieldToScreen(otto.pos.x, otto.pos.y);
-  const rx = st.sight * field.px;
-  const ry = rx * FIELD_TILT;
-  ctx.strokeStyle = 'rgba(126, 255, 190, 0.55)';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.ellipse(p.x, p.y, rx, ry, 0, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(126, 255, 190, 0.2)';
-  ctx.beginPath();
-  ctx.ellipse(p.x, p.y, rx * 0.5, ry * 0.5, 0, 0, Math.PI * 2);
-  ctx.stroke();
+  for (const o of ottos) {
+    const p = fieldToScreen(o.pos.x, o.pos.y);
+    const rx = o.stats.sight * field.px;
+    const ry = rx * FIELD_TILT;
+    ctx.strokeStyle = 'rgba(126, 255, 190, 0.55)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(126, 255, 190, 0.2)';
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, rx * 0.5, ry * 0.5, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -788,7 +973,9 @@ function drawFieldDebug() {
 function drawHud() {
   const s = constrain(width * 0.031, 10, 16);
   const found = marker.found;
-  const st = otto.stats;
+  const lead = ottos[0];
+  const st = lead ? lead.stats : defaultStats();
+  const need = energyRequirementFor(st.size);
   const online = shareConnected
     ? (Array.isArray(guests) ? guests.length : 0) + 1
     : 0;
@@ -834,16 +1021,16 @@ function drawHud() {
     16 + s * 4.05
   );
   text(
-    `SIGHT ${st.sight.toFixed(0)} · AGG ${st.aggression} · NEED ${st.energyRequirement.toFixed(0)}`,
+    `SIGHT ${st.sight.toFixed(0)} · AGG ${st.aggression} · NEED ${need}/DAY`,
     18,
     16 + s * 5.1
   );
   fill(255, 214, 140, 170);
   text(
-    otto.has
-      ? `ENERGY ${Math.round(otto.energy)}/${st.energyRequirement.toFixed(0)} · ${
-          MODE_LABEL[otto.mode] || ''
-        }`
+    lead
+      ? `ENERGY ${Math.round(lead.energy)}/${need * ENERGY_STORE_MULT} · ${
+          MODE_LABEL[lead.mode] || ''
+        } · OTTOS ${ottos.length} · DAY ${dayNumber}`
       : 'NO OTTO YET · SHOW IT A GREEN OBJECT',
     18,
     16 + s * 6.15
@@ -928,7 +1115,8 @@ function layoutPanel() {
   const w = Math.min(width - 24, 380);
   const rowH = Math.max(30, Math.min(42, height * 0.048));
   const headH = rowH * 1.15;
-  const h = headH + STAT_ROWS.length * rowH + 10;
+  const footH = rowH * 1.7;
+  const h = headH + STAT_ROWS.length * rowH + footH + 10;
   const x = (width - w) / 2;
   const y = height - h - 12;
 
@@ -938,6 +1126,7 @@ function layoutPanel() {
   panel.h = h;
   panel.rowH = rowH;
   panel.headH = headH;
+  panel.footH = footH;
   panel.fieldHit = { x: x + w - 78, y: y + 7, w: 66, h: headH - 14 };
 
   const trackX = x + 98;
@@ -954,7 +1143,11 @@ function drawPanel() {
   layoutPanel();
 
   const s = constrain(width * 0.031, 10, 16);
-  const st = otto.stats;
+  const lead = ottos[0];
+  if (!lead) return;
+  const st = lead.stats;
+  const need = energyRequirementFor(st.size);
+  const secsLeft = Math.max(0, Math.ceil(DAY_SECONDS - dayClock));
 
   push();
   noStroke();
@@ -1006,6 +1199,22 @@ function drawPanel() {
     text(formatStat(row.key, st[row.key]), panel.x + panel.w - 14, cy);
   }
 
+  // The daily cost is not a slider: it comes from Size alone.
+  fill(140, 190, 215, 170);
+  textAlign(LEFT, CENTER);
+  textSize(s * 0.55);
+  const footY = panel.y + panel.h - panel.footH;
+  text(
+    `ENERGY/DAY ${need} = SIZE × ${ENERGY_PER_SIZE}`,
+    panel.x + 14,
+    footY + panel.footH * 0.32
+  );
+  text(
+    `DAY ${dayNumber} · ${secsLeft}s LEFT · ${ENERGY_STORE_MULT}× NEED = REPRODUCE`,
+    panel.x + 14,
+    footY + panel.footH * 0.72
+  );
+
   pop();
 }
 
@@ -1035,11 +1244,13 @@ function panelRowAt(x, y) {
 }
 
 function setStatFromX(row, x) {
+  const lead = ottos[0];
+  if (!lead) return;
   const t = constrain((x - row.trackX) / row.trackW, 0, 1);
   let v = row.min + t * (row.max - row.min);
   v = Math.round(v / row.step) * row.step;
   v = Math.round(v * 1000) / 1000;
-  otto.stats[row.key] = constrain(v, row.min, row.max);
+  lead.stats[row.key] = constrain(v, row.min, row.max);
 }
 
 // --------------------------------------------------------------------- input
@@ -1074,7 +1285,9 @@ function mousePressed() {
     return false;
   }
 
-  if (otto.has && otto.lock > 0.3) otto.pop = 1;
+  if (fieldEntered && fieldLock > 0.3) {
+    for (const o of ottos) o.pop = 1;
+  }
   return false;
 }
 
