@@ -99,9 +99,7 @@ let stack;
 let marker;
 let ottos = [];
 let nextOttoId = 1;
-let ottoGif;
-let ottoLayer = null;
-let ottoFills = [];
+let ottoAssets = []; // { gif, layer, fills } for each sprite asset
 let field;
 let remote = new Map();
 let localFood = {};
@@ -177,12 +175,14 @@ async function setup() {
   visited = new Uint8Array(SCAN_W * SCAN_H);
   stack = new Int32Array(SCAN_W * SCAN_H);
 
-  ottoGif = null;
-  try {
-    ottoGif = await loadImage('Otto1.gif');
-    prepareOttoArt();
-  } catch (e) {
-    console.warn('Could not load Otto1.gif', e);
+  ottoAssets = [];
+  for (const name of ['Otto1.gif', 'Otto2.gif', 'Otto3.gif']) {
+    try {
+      const gif = await loadImage(name);
+      ottoAssets.push(prepareOttoAsset(gif));
+    } catch (e) {
+      console.warn('Could not load ' + name, e);
+    }
   }
 
   resetTracking();
@@ -380,6 +380,7 @@ function startExamine(target, kind = 'local') {
     targetSize,
     facing: target.facing || 1,
     color,
+    asset: ottoAssetFor(target.id),
   };
   examineT = 0;
   examineLeaving = false;
@@ -473,7 +474,7 @@ function updateExamine(dt) {
 function drawExamineClone() {
   if (!examineClone) return;
   const c = examineClone;
-  drawOttoAt(c.x, c.y, c.size, 1, c.facing, 0, 1, c.color);
+  drawOttoAt(c.x, c.y, c.size, 1, c.facing, 0, 1, c.color, c.asset);
 }
 
 function drawStatsCard() {
@@ -1693,31 +1694,49 @@ function colonyColorFor(clientId) {
   return colonyColorMap().get(clientId) || COLONY_COLORS[0];
 }
 
-// Otto1.gif is line art: the body is transparent. Tinting with source-atop
-// would only recolour the ink, so the enclosed area is filled separately with
-// a soft colour and drawn behind the line work.
-function prepareOttoArt() {
-  ottoFills = [];
-  if (!ottoGif) return;
+// The Otto sprites are line art: the body is transparent. Tinting with
+// source-atop would only recolour the ink, so the enclosed area is filled
+// separately with a soft colour and drawn behind the line work.
+function prepareOttoAsset(gif) {
+  const layer = createGraphics(OTTO_CROP.w, OTTO_CROP.h);
+  layer.pixelDensity(1);
+  const fills = [];
 
-  ottoLayer = createGraphics(OTTO_CROP.w, OTTO_CROP.h);
-  ottoLayer.pixelDensity(1);
-
-  const props = ottoGif.gifProperties;
+  const props = gif.gifProperties;
   if (props && Array.isArray(props.frames)) {
     for (const frame of props.frames) {
-      ottoFills.push(buildOttoFills(frame.image));
+      fills.push(buildOttoFills(frame.image));
     }
-  } else if (ottoGif.canvas) {
+  } else if (gif.canvas) {
     const c = document.createElement('canvas');
-    c.width = ottoGif.canvas.width;
-    c.height = ottoGif.canvas.height;
+    c.width = gif.canvas.width;
+    c.height = gif.canvas.height;
     const cx = c.getContext('2d');
-    cx.drawImage(ottoGif.canvas, 0, 0);
-    ottoFills.push(
-      buildOttoFills(cx.getImageData(0, 0, c.width, c.height))
-    );
+    cx.drawImage(gif.canvas, 0, 0);
+    fills.push(buildOttoFills(cx.getImageData(0, 0, c.width, c.height)));
   }
+
+  return { gif, layer, fills };
+}
+
+function idHash(id) {
+  const text = String(id);
+  let h = 0;
+  for (let i = 0; i < text.length; i++) {
+    h = (h * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return h;
+}
+
+// Each Otto keeps one sprite asset for its whole life, chosen from its id.
+// New Ottos are distributed across the available assets.
+function ottoAssetIndexFor(id) {
+  if (!ottoAssets.length) return 0;
+  return idHash(id) % ottoAssets.length;
+}
+
+function ottoAssetFor(id) {
+  return ottoAssets[ottoAssetIndexFor(id)] || ottoAssets[0];
 }
 
 // Build one coloured fill canvas per palette entry for a single GIF frame.
@@ -1814,9 +1833,10 @@ function buildOttoFills(src) {
   return fills;
 }
 
-function ottoFillFor(frame, color) {
-  if (!ottoFills.length) return null;
-  const set = ottoFills[frame % ottoFills.length] || ottoFills[0];
+function ottoFillFor(asset, frame, color) {
+  const fills = asset && asset.fills;
+  if (!fills || !fills.length) return null;
+  const set = fills[frame % fills.length] || fills[0];
   const index = COLONY_COLORS.indexOf(color);
   return set[index] || set[0] || null;
 }
@@ -1845,7 +1865,7 @@ function drawColonyRing(ctx, cx, groundY, w, h, alpha, color) {
 // Rings are drawn in their own pass so every ring sits underneath every Otto,
 // rather than a nearer Otto's ring crossing an overlapping neighbour.
 function drawColonyRings() {
-  if (!field.ok || !ottoGif || fieldLock < 0.01) return;
+  if (!field.ok || !ottoAssets.length || fieldLock < 0.01) return;
   if (examineT > 0.15) return;
 
   const ctx = drawingContext;
@@ -1875,7 +1895,7 @@ function drawColonyRings() {
 }
 
 function drawLocalOttos() {
-  if (!ottoGif || !field.ok || fieldLock < 0.01) return;
+  if (!ottoAssets.length || !field.ok || fieldLock < 0.01) return;
   const color = colonyColorFor(window.shareClientId);
   const sceneAlpha = 1 - examineT * 0.75;
   for (const o of ottos) {
@@ -1892,13 +1912,14 @@ function drawLocalOttos() {
       o.facing,
       o.pop,
       o.hp / MAX_HP,
-      color
+      color,
+      ottoAssetFor(o.id)
     );
   }
 }
 
 function drawRemoteOttos() {
-  if (!field.ok || !ottoGif) return;
+  if (!field.ok || !ottoAssets.length) return;
   const sceneAlpha = 1 - examineT * 0.75;
   for (const r of remote.values()) {
     if (r.lock <= 0.01) continue;
@@ -1916,7 +1937,8 @@ function drawRemoteOttos() {
       r.facing,
       0,
       r.hp / MAX_HP,
-      r.dev ? r.color : colonyColorFor(r.client)
+      r.dev ? r.color : colonyColorFor(r.client),
+      ottoAssetFor(r.id)
     );
   }
 }
@@ -1929,70 +1951,56 @@ function drawOttoAt(
   facing,
   pop,
   hpFrac = 1,
-  color = COLONY_COLORS[0]
+  color = COLONY_COLORS[0],
+  asset = null
 ) {
+  const art = asset || ottoAssets[0];
+  if (!art) return;
   const h = OTTO_UNITS_TALL * size * field.px * (1 + pop * 0.1);
   const w = h * (OTTO_CROP.w / OTTO_CROP.h);
   const ctx = drawingContext;
 
   // Draw the Otto into a small buffer so the body fill can sit behind the ink
   // while the ink itself is tinted towards the colony colour.
-  if (ottoLayer) {
-    ottoLayer.clear();
-    ottoLayer.image(
-      ottoGif,
-      0,
-      0,
-      OTTO_CROP.w,
-      OTTO_CROP.h,
-      OTTO_CROP.x,
-      OTTO_CROP.y,
-      OTTO_CROP.w,
-      OTTO_CROP.h
-    );
+  art.layer.clear();
+  art.layer.image(
+    art.gif,
+    0,
+    0,
+    OTTO_CROP.w,
+    OTTO_CROP.h,
+    OTTO_CROP.x,
+    OTTO_CROP.y,
+    OTTO_CROP.w,
+    OTTO_CROP.h
+  );
 
-    const lc = ottoLayer.drawingContext;
-    const frame = ottoGif.gifProperties
-      ? ottoGif.gifProperties.displayIndex
-      : 0;
-    const fill = ottoFillFor(frame, color);
+  const lc = art.layer.drawingContext;
+  const frame = art.gif.gifProperties
+    ? art.gif.gifProperties.displayIndex
+    : 0;
+  const fill = ottoFillFor(art, frame, color);
 
+  lc.save();
+  lc.globalCompositeOperation = 'source-atop';
+  lc.globalAlpha = OTTO_TINT_ALPHA;
+  lc.fillStyle = rgbColor(color);
+  lc.fillRect(0, 0, OTTO_CROP.w, OTTO_CROP.h);
+  lc.restore();
+
+  if (fill) {
     lc.save();
-    lc.globalCompositeOperation = 'source-atop';
-    lc.globalAlpha = OTTO_TINT_ALPHA;
-    lc.fillStyle = rgbColor(color);
-    lc.fillRect(0, 0, OTTO_CROP.w, OTTO_CROP.h);
+    lc.globalCompositeOperation = 'destination-over';
+    lc.globalAlpha = OTTO_FILL_ALPHA;
+    lc.drawImage(fill, 0, 0);
     lc.restore();
-
-    if (fill) {
-      lc.save();
-      lc.globalCompositeOperation = 'destination-over';
-      lc.globalAlpha = OTTO_FILL_ALPHA;
-      lc.drawImage(fill, 0, 0);
-      lc.restore();
-    }
   }
 
   ctx.save();
   ctx.globalAlpha = alpha;
   ctx.translate(cx, groundY);
   ctx.scale(facing, 1);
-
-  if (ottoLayer) {
-    ctx.drawImage(ottoLayer.canvas, -w / 2, -h, w, h);
-  } else {
-    image(
-      ottoGif,
-      -w / 2,
-      -h,
-      w,
-      h,
-      OTTO_CROP.x,
-      OTTO_CROP.y,
-      OTTO_CROP.w,
-      OTTO_CROP.h
-    );
-  }
+  ctx.drawImage(art.layer.canvas, -w / 2, -h, w, h);
 
   // Small health bar above a damaged Otto.
   if (hpFrac < 0.999 && alpha > 0.03) {
@@ -2139,22 +2147,8 @@ function drawHud() {
   textSize(s * 0.55);
   text('YOU', swX + s * 0.55, 16 + s * 2.95 + 1);
 
-  // Stats.
-  fill(170, 215, 235, 160);
-  textSize(s * 0.6);
-  text(
-    `ATK ${st.attack} · SPD ${st.speed.toFixed(1)} · SIZE ${st.size.toFixed(
-      2
-    )} · HP ${lead ? Math.max(0, Math.round(lead.hp)) : 0}/${MAX_HP}`,
-    18,
-    16 + s * 4.05
-  );
-  text(
-    `SIGHT ${st.sight.toFixed(0)} · AGG ${st.aggression} · NEED ${need}/DAY`,
-    18,
-    16 + s * 5.1
-  );
   fill(255, 214, 140, 170);
+  textSize(s * 0.6);
   text(
     lead
       ? `ENERGY ${Math.round(lead.energy)}/${need * ENERGY_STORE_MULT} · ${
@@ -2164,7 +2158,7 @@ function drawHud() {
       ? 'COLONY LOST · RELOAD TO BEGIN AGAIN'
       : 'NO OTTO YET · SHOW IT A GREEN OBJECT',
     18,
-    16 + s * 6.15
+    16 + s * 4.05
   );
 
   // Day progress timer.
@@ -2172,7 +2166,7 @@ function drawHud() {
   const barW = Math.min(width * 0.42, s * 18);
   const barH = s * 0.42;
   const barX = 18;
-  const barY = 16 + s * 7.0;
+  const barY = 16 + s * 5.1;
   noStroke();
   fill(255, 255, 255, 34);
   rect(barX, barY, barW, barH, barH / 2);
@@ -2194,7 +2188,7 @@ function drawHud() {
   devHit = null;
   spawnHit = null;
   const rowH = s * 1.9;
-  const rowY = 16 + s * 7.45;
+  const rowY = 16 + s * 5.9;
   const label = found ? 'LOCKED' : 'SEEKING';
   const tone = found ? [126, 255, 190] : [255, 200, 110];
 
@@ -2215,14 +2209,14 @@ function drawHud() {
   tuneHit = { x: chipX, y: chipY, w: chipW, h: chipH };
 
   noFill();
-  stroke(panel.open ? color(126, 255, 190, 170) : color(140, 230, 255, 85));
+  stroke(showField ? color(126, 255, 190, 170) : color(140, 230, 255, 85));
   strokeWeight(1);
   rect(chipX, chipY, chipW, chipH, chipH / 2);
   noStroke();
-  fill(panel.open ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
+  fill(showField ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
   textAlign(CENTER, CENTER);
   textSize(s * 0.58);
-  text(panel.open ? 'CLOSE' : 'TUNE', chipX + chipW / 2, chipY + chipH / 2 + 1);
+  text('FIELD', chipX + chipW / 2, chipY + chipH / 2 + 1);
 
   // Solo pause toggle. In a shared room the day pauses itself and players tap YES.
   if (!shareConnected && !panel.open) {
@@ -2344,16 +2338,12 @@ function drawHud() {
     text(joinLabel, width / 2, by + bh / 2 + 1);
   }
 
-  // Hint.
-  if (!panel.open) {
+  // Hint while searching for the marker.
+  if (!found) {
     textAlign(CENTER, BOTTOM);
     fill(205, 232, 245, 180);
     textSize(s * 0.8);
-    text(
-      found ? 'TAP TO MAKE IT HOP' : 'POINT AT A GREEN OBJECT ON THE TABLE',
-      width / 2,
-      height - 20
-    );
+    text('POINT AT A GREEN OBJECT ON THE TABLE', width / 2, height - 20);
   }
 
   pop();
@@ -2547,9 +2537,7 @@ function mousePressed() {
   }
 
   if (hitRect(tuneHit, mouseX, mouseY)) {
-    panel.open = !panel.open;
-    panel.drag = null;
-    if (panel.open) layoutPanel();
+    showField = !showField;
     return false;
   }
 
@@ -2622,9 +2610,6 @@ function mousePressed() {
     }
   }
 
-  if (fieldEntered && fieldLock > 0.3) {
-    for (const o of ottos) o.pop = 1;
-  }
   return false;
 }
 
