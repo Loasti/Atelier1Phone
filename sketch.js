@@ -111,6 +111,12 @@ let markerLost = 0;
 let dayClock = 0;
 let dayNumber = 1;
 let simClock = 0;
+let clockSyncTimer = 0;
+let lastElapsedAt = 0;
+let lastSyncedElapsed = 0;
+let wasDayLeader = false;
+let lastSeenTimeScale = 1;
+let wasPausedForClock = false;
 
 let lastMillis = 0;
 let scanTick = 0;
@@ -200,22 +206,135 @@ function shareReady() {
   if (!shared.pause || typeof shared.pause !== 'object') {
     shared.pause = { active: false, day: 0, votes: {} };
   }
+  remote.clear();
+  devMode = false;
+  if (typeof shared.day !== 'number') shared.day = 1;
+  if (typeof shared.dayElapsed !== 'number') shared.dayElapsed = 0;
+  if (typeof shared.foodSeedDay !== 'number') shared.foodSeedDay = 0;
+  if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
+
+  // Adopt the room's current day and clock instead of starting fresh.
+  dayNumber = shared.day;
+  dayClock = shared.dayElapsed;
+  lastSyncedElapsed = dayClock;
+  lastElapsedAt = millis() / 1000;
+  clockSyncTimer = 0;
+  wasDayLeader = false;
+  wasPausedForClock = false;
+
   // Joining mid-pause means this phone has not voted yet.
   if (shared.pause.active && shared.pause.day === dayNumber) {
     paused = true;
     pauseDay = dayNumber;
     localReady = false;
+  } else {
+    paused = false;
+    pauseDay = 0;
+    localReady = false;
   }
-  remote.clear();
-  devMode = false;
-  if (typeof shared.foodDay !== 'number') shared.foodDay = 0;
-  if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
-  if (shareIsHost && Object.keys(shared.food || {}).length === 0) {
-    const fresh = {};
-    seedFood(fresh, FOOD_PER_DAY);
-    shared.food = fresh;
-    shared.foodDay = dayNumber;
+}
+
+function playerIds() {
+  const ids = [];
+  if (window.shareClientId) ids.push(window.shareClientId);
+  if (Array.isArray(guests)) {
+    for (const g of guests) {
+      if (g && g.id && (Array.isArray(g.ottos) || g.otto)) ids.push(g.id);
+    }
   }
+  return [...new Set(ids)].sort();
+}
+
+// The lowest connected client id owns the shared day clock. If that phone
+// leaves, the next lowest id takes over automatically.
+function isDayLeader() {
+  if (!shareConnected || !window.shareClientId) return false;
+  const ids = playerIds();
+  return ids.length > 0 && ids[0] === window.shareClientId;
+}
+
+function updateSharedDayClock(dt) {
+  if (!shareConnected) return;
+
+  const scale =
+    typeof shared.timeScale === 'number' ? shared.timeScale : 1;
+  const leader = isDayLeader();
+  const now = millis() / 1000;
+  const sharedPaused = !!(shared.pause && shared.pause.active);
+
+  // Adopt a day change from the room, and run this colony's end-of-day work
+  // exactly once for that shared day.
+  if (typeof shared.day === 'number' && shared.day !== dayNumber) {
+    dayNumber = shared.day;
+    dayClock = typeof shared.dayElapsed === 'number' ? shared.dayElapsed : 0;
+    lastSyncedElapsed = dayClock;
+    lastElapsedAt = now;
+    processColonyDayEnd();
+  }
+
+  if (paused || sharedPaused) {
+    dayClock = typeof shared.dayElapsed === 'number' ? shared.dayElapsed : dayClock;
+    lastElapsedAt = now;
+    wasPausedForClock = true;
+    wasDayLeader = leader;
+    return;
+  }
+
+  if (wasPausedForClock) {
+    dayClock = typeof shared.dayElapsed === 'number' ? shared.dayElapsed : 0;
+    lastSyncedElapsed = dayClock;
+    lastElapsedAt = now;
+    clockSyncTimer = 0;
+    wasPausedForClock = false;
+  }
+
+  if (leader) {
+    if (!wasDayLeader && typeof shared.dayElapsed === 'number') {
+      dayClock = shared.dayElapsed;
+      lastSyncedElapsed = dayClock;
+      lastElapsedAt = now;
+    }
+
+    if (scale !== lastSeenTimeScale) {
+      lastSeenTimeScale = scale;
+      shared.dayElapsed = Math.round(dayClock * 100) / 100;
+      clockSyncTimer = 0;
+    }
+
+    dayClock += dt * scale;
+    clockSyncTimer += dt;
+    if (clockSyncTimer >= 0.5) {
+      clockSyncTimer = 0;
+      shared.dayElapsed = Math.round(dayClock * 100) / 100;
+    }
+
+    if (dayClock >= DAY_SECONDS) {
+      const next = (typeof shared.day === 'number' ? shared.day : dayNumber) + 1;
+      shared.day = next;
+      shared.dayElapsed = 0;
+      shared.food = {};
+      shared.pause = { active: true, day: next, votes: {} };
+      dayNumber = next;
+      dayClock = 0;
+      lastSyncedElapsed = 0;
+      lastElapsedAt = now;
+      paused = true;
+      wasPausedForClock = true;
+      processColonyDayEnd();
+    }
+  } else {
+    if (
+      typeof shared.dayElapsed === 'number' &&
+      shared.dayElapsed !== lastSyncedElapsed
+    ) {
+      lastSyncedElapsed = shared.dayElapsed;
+      lastElapsedAt = now;
+    }
+    dayClock = lastSyncedElapsed + (now - lastElapsedAt) * scale;
+    if (dayClock < 0) dayClock = 0;
+  }
+
+  wasDayLeader = leader;
 }
 
 function resetTracking() {
@@ -232,6 +351,12 @@ function resetTracking() {
   dayClock = 0;
   dayNumber = 1;
   simClock = 0;
+  clockSyncTimer = 0;
+  lastElapsedAt = 0;
+  lastSyncedElapsed = 0;
+  wasDayLeader = false;
+  lastSeenTimeScale = 1;
+  wasPausedForClock = false;
   paused = false;
   pauseDay = 0;
   localReady = false;
@@ -620,6 +745,10 @@ function draw() {
   const dt = constrain(now - lastMillis, 0, 0.1);
   lastMillis = now;
 
+  // The shared day clock runs even before the camera is live, so a connected
+  // room keeps the same time even if one phone is not viewing the field.
+  updateSharedDayClock(dt);
+
   const live =
     window.cameraEnabled &&
     cam &&
@@ -888,10 +1017,12 @@ function updateBehaviour(dt, sync = true) {
   // is smaller than the post-reproduction one so two Ottos can share food.
   separateOttos(1, OTTO_COLLISION_SPACING);
 
-  dayClock += dt;
-  if (dayClock >= DAY_SECONDS) {
-    dayClock = 0;
-    endOfDay();
+  if (!shareConnected) {
+    dayClock += dt;
+    if (dayClock >= DAY_SECONDS) {
+      dayClock = 0;
+      endOfDay();
+    }
   }
 
   // Remove Ottos once their death fade has played out.
@@ -903,9 +1034,9 @@ function updateBehaviour(dt, sync = true) {
   if (sync) syncMe();
 }
 
-// Reproduction is checked once, when the day's food is tallied. Every Otto
-// then starts the next day empty, including the new children.
-function endOfDay() {
+// Colony-only end-of-day work. In a shared room every phone runs this once
+// when the shared day advances; the day counter itself is shared.
+function processColonyDayEnd() {
   const parents = [];
 
   // Any Otto that did not eat its daily requirement starves and is removed.
@@ -936,30 +1067,17 @@ function endOfDay() {
       o.wander = null;
     }
   }
+}
 
+// Solo day end: colony work plus the local day/pause transition.
+function endOfDay() {
+  processColonyDayEnd();
   dayNumber += 1;
-
-  // Clear the old day's food; the new 30 pieces appear when play resumes.
-  if (shareConnected) shared.food = {};
-  else localFood = {};
-
-  // A new day begins paused. In solo the player can resume immediately; in a
-  // shared room everyone must tap YES before the day (and food spawning) starts.
+  localFood = {};
   paused = true;
   pauseDay = dayNumber;
   localReady = false;
-
-  if (autoSkipDay && !shareConnected) {
-    // Solo: skip the confirmation entirely.
-    paused = false;
-  } else if (shareConnected) {
-    const votes = {};
-    if (autoSkipDay && shareClientId) {
-      votes[shareClientId] = true;
-      localReady = true;
-    }
-    shared.pause = { active: true, day: dayNumber, votes };
-  }
+  if (autoSkipDay) paused = false;
 }
 
 // The child inherits a mutated genome but starts the new day with no food.
@@ -1369,11 +1487,14 @@ function updateFood(dt) {
   if (paused) return;
 
   if (shareConnected) {
-    if (shared.foodDay === dayNumber) return;
+    // Only the day leader seeds, so multiple phones cannot overwrite the
+    // room's food layout.
+    if (!isDayLeader()) return;
+    if (shared.foodSeedDay === shared.day) return;
     const fresh = {};
     seedFood(fresh, FOOD_PER_DAY);
     shared.food = fresh;
-    shared.foodDay = dayNumber;
+    shared.foodSeedDay = shared.day;
   } else {
     if (localFoodDay === dayNumber) return;
     const fresh = {};
