@@ -188,6 +188,11 @@ async function setup() {
   pixelDensity(min(2, displayDensity()));
   frameRate(60);
   lockGestures();
+  enableMobileFullscreen();
+  fitCanvasToViewport();
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitCanvasToViewport);
+  }
   textFont('monospace');
 
   // Shared room for the class session. `me.ottos` is this phone's colony;
@@ -2250,8 +2255,8 @@ function drawConnectionScreen() {
 
 function drawAllocationScreen() {
   const s = constrain(width * 0.031, 10, 16);
-  const panelW = Math.min(width - 30, 430);
-  const panelH = Math.min(height - 50, 560);
+  const panelW = Math.min(width - 16, 680);
+  const panelH = Math.min(height - 20, 600);
   const panelX = (width - panelW) / 2;
   const panelY = (height - panelH) / 2;
   allocationHits = [];
@@ -2260,24 +2265,57 @@ function drawAllocationScreen() {
 
   push();
   noStroke();
-  fill(4, 10, 16, 238);
+  fill(4, 10, 16, 240);
   rect(0, 0, width, height);
+  fill(7, 14, 22, 245);
+  rect(panelX, panelY, panelW, panelH, 16);
+  stroke(140, 230, 255, 60);
+  strokeWeight(1);
+  noFill();
+  rect(panelX, panelY, panelW, panelH, 16);
+  noStroke();
+
+  const pad = Math.max(12, s * 0.9);
+  const headerH = Math.max(58, s * 3.6);
+  const footerH = Math.max(58, s * 3.2);
+  const contentY = panelY + headerH;
+  const contentH = panelH - headerH - footerH;
+  const leftW = Math.min(panelW * 0.42, 230);
+  const rightX = panelX + leftW + pad;
+  const rightW = panelW - leftW - pad * 2;
 
   fill(240, 252, 255, 240);
   textAlign(LEFT, TOP);
-  textSize(s * 1.15);
-  text('CREATE YOUR OTTO', panelX + 18, panelY + 16);
+  textSize(Math.max(15, s * 1.1));
+  text('CREATE YOUR OTTO', panelX + pad, panelY + 12);
   fill(126, 255, 190, 220);
-  textSize(s * 0.8);
-  text(`${allocationRemaining} POINTS LEFT`, panelX + 18, panelY + 16 + s * 1.6);
+  textSize(Math.max(11, s * 0.78));
+  text(`${allocationRemaining} POINTS LEFT`, panelX + pad, panelY + 12 + s * 1.5);
 
-  // Close-up preview of the Otto being created.
-  const previewBox = Math.min(140, panelH * 0.26);
-  const previewBottom = panelY + 52 + previewBox;
-  const previewH = constrain(100 + allocationPoints.size * 5, 90, previewBox - 8);
-  const previewCx = panelX + panelW / 2;
+  // Left column: preview + colour picker, centred vertically beside the stats.
+  const cols = 5;
+  const swGap = leftW / cols;
+  const swR = Math.min(9, swGap * 0.3);
+  const swatchRows = Math.ceil(COLONY_COLORS.length / cols);
+  const swatchH =
+    Math.max(14, swR + 6) + (swatchRows - 1) * (swR * 2 + 8) + swR + 4;
+  // Keep the preview inside the left column: width follows the sprite's aspect.
+  const previewCap = Math.max(58, (leftW - 12) / 1.1);
+  const previewH = Math.max(
+    58,
+    Math.min(
+      150 + allocationPoints.size * 8,
+      previewCap,
+      Math.min(contentH * 0.58, 240) - 18
+    )
+  );
+  const previewAreaH = previewH + 18;
+  const leftGroupH = previewAreaH + 8 + swatchH;
+  const leftOffset = Math.max(0, (contentH - leftGroupH) / 2);
+  const previewBottom = contentY + leftOffset + previewAreaH;
+  const previewCx = panelX + leftW / 2;
 
-  fill(255, 255, 255, 18);
+  fill(255, 255, 255, 16);
   ellipse(previewCx, previewBottom, previewH * 1.1, previewH * 0.3);
   drawOttoPreview(
     previewCx,
@@ -2287,49 +2325,47 @@ function drawAllocationScreen() {
     ottoAssets[pendingAssetIndex] || ottoAssetFor(nextOttoId)
   );
 
-  // Team colour picker.
-  const colorY = previewBottom + 16;
+  const colorY = previewBottom + 8;
   fill(150, 200, 225, 180);
   textAlign(LEFT, CENTER);
-  textSize(s * 0.55);
-  text('TEAM COLOUR', panelX + 18, colorY);
-  const swatches = COLONY_COLORS.length;
-  const gap = (panelW - 36) / swatches;
-  const swR = Math.min(9, gap * 0.32);
-  const swCy = colorY + Math.max(16, swR + 8);
-  for (let i = 0; i < swatches; i++) {
-    const cx = panelX + 18 + gap * (i + 0.5);
+  textSize(Math.max(9, s * 0.55));
+  text('TEAM COLOUR', panelX + 6, colorY);
+
+  const swCy0 = colorY + Math.max(14, swR + 6);
+  for (let i = 0; i < COLONY_COLORS.length; i++) {
+    const cx = panelX + swGap * ((i % cols) + 0.5);
+    const cy = swCy0 + Math.floor(i / cols) * (swR * 2 + 8);
     noStroke();
     fill(COLONY_COLORS[i][0], COLONY_COLORS[i][1], COLONY_COLORS[i][2], 230);
-    circle(cx, swCy, swR * 2);
+    circle(cx, cy, swR * 2);
     if (i === teamColorIndex) {
       noFill();
       stroke(255, 255, 255, 220);
       strokeWeight(2);
-      circle(cx, swCy, swR * 2 + 7);
+      circle(cx, cy, swR * 2 + 7);
       noStroke();
     }
     colorHits.push({
       x: cx - swR - 5,
-      y: swCy - swR - 5,
+      y: cy - swR - 5,
       w: swR * 2 + 10,
       h: swR * 2 + 10,
       index: i,
     });
   }
 
+  // Right column: stat rows.
   const keys = ['attack', 'speed', 'size', 'sight', 'aggression', 'hp'];
   const labels = ['ATTACK', 'SPEED', 'SIZE', 'SIGHT', 'AGGRESSION', 'HP'];
   const base = defaultStats();
-  const confirmH = s * 2.6;
-  const confirmY = panelY + panelH - confirmH - 18;
-  const startY = swCy + swR + 18;
-  const rowH = Math.min(s * 2.4, (confirmY - 14 - startY) / 6);
+  const rowH = Math.min(s * 4.6, (contentH - 20) / 6);
+  const rowsY = contentY + (contentH - rowH * 6) / 2;
 
   for (let i = 0; i < keys.length; i++) {
     const key = keys[i];
-    const y = startY + i * rowH;
     const points = allocationPoints[key];
+    const y = rowsY + i * rowH;
+    const cy = y + rowH / 2;
     let value;
     if (key === 'hp') value = `${MAX_HP + points * 10}`;
     else if (key === 'speed') value = (base.speed + points * 0.1).toFixed(1);
@@ -2338,20 +2374,19 @@ function drawAllocationScreen() {
 
     fill(170, 215, 235, 190);
     textAlign(LEFT, CENTER);
-    textSize(s * 0.61);
-    text(labels[i], panelX + 18, y + rowH * 0.35);
+    textSize(Math.max(9, s * 0.6));
+    text(points > 0 ? `${labels[i]} +${points}` : labels[i], rightX, cy);
+
     fill(240, 252, 255, 230);
     textAlign(RIGHT, CENTER);
-    text(value, panelX + panelW - s * 8.0, y + rowH * 0.35);
-    fill(126, 255, 190, 190);
-    textSize(s * 0.52);
-    text(`+${points}`, panelX + panelW - s * 6.0, y + rowH * 0.35);
+    textSize(Math.max(10, s * 0.66));
+    text(value, rightX + rightW - s * 6.4, cy);
 
-    const bw = s * 2.4;
-    const bh = Math.min(s * 1.6, rowH * 0.72);
-    const by = y + rowH * 0.35 - bh / 2;
-    const minusX = panelX + panelW - s * 5.0;
-    const plusX = panelX + panelW - s * 2.4;
+    const bw = s * 2.2;
+    const bh = Math.min(s * 1.6, rowH * 0.7);
+    const by = cy - bh / 2;
+    const minusX = rightX + rightW - s * 5.6;
+    const plusX = rightX + rightW - s * 3.1;
 
     for (const [bx, label, dir] of [
       [minusX, '−', -1],
@@ -2365,28 +2400,33 @@ function drawAllocationScreen() {
       noStroke();
       fill(active ? color(150, 235, 255, 220) : color(100, 120, 135, 120));
       textAlign(CENTER, CENTER);
-      textSize(s * 0.8);
+      textSize(s * 0.78);
       text(label, bx + bw / 2, by + bh / 2 + 1);
       if (active) allocationHits.push({ x: bx, y: by, w: bw, h: bh, key, dir });
     }
   }
 
-  const bw = panelW - 36;
-  const bh = confirmH;
-  const bx = panelX + 18;
-  const by = confirmY;
+  // Bottom confirm button.
+  const confirmH = Math.max(50, s * 2.6);
+  const bx = panelX + pad;
+  const by = panelY + panelH - confirmH - 14;
+  const bw = panelW - pad * 2;
   const ready = allocationRemaining === 0;
-  allocationConfirmHit = { x: bx, y: by, w: bw, h: bh, enabled: ready };
+  allocationConfirmHit = { x: bx, y: by, w: bw, h: confirmH, enabled: ready };
 
   noFill();
   stroke(ready ? color(126, 255, 190, 180) : color(80, 100, 115, 90));
   strokeWeight(1);
-  rect(bx, by, bw, bh, bh / 2);
+  rect(bx, by, bw, confirmH, confirmH / 2);
   noStroke();
   fill(ready ? color(126, 255, 190, 230) : color(100, 120, 135, 150));
   textAlign(CENTER, CENTER);
-  textSize(s * 0.82);
-  text(ready ? 'CONFIRM & PLACE' : 'SPEND ALL 10 POINTS', bx + bw / 2, by + bh / 2 + 1);
+  textSize(Math.max(11, s * 0.82));
+  text(
+    ready ? 'CONFIRM & PLACE' : 'SPEND ALL 10 POINTS',
+    bx + bw / 2,
+    by + confirmH / 2 + 1
+  );
 
   pop();
 }
@@ -3620,12 +3660,82 @@ function mouseReleased() {
   return false;
 }
 
-function windowResized() {
-  resizeCanvas(windowWidth, windowHeight);
+function viewportSize() {
+  const vv = window.visualViewport;
+  return {
+    w: Math.round(vv && vv.width ? vv.width : windowWidth),
+    h: Math.round(vv && vv.height ? vv.height : windowHeight),
+  };
+}
+
+function fitCanvasToViewport() {
+  const v = viewportSize();
+  if (v.w !== width || v.h !== height) resizeCanvas(v.w, v.h);
+}
+
+function resetUiHits() {
   joinHit = null;
   tuneHit = null;
   pauseHit = null;
   yesHit = null;
   autoHit = null;
   timeHit = null;
+}
+
+function windowResized() {
+  fitCanvasToViewport();
+  resetUiHits();
+}
+
+// Phones keep browser chrome (address bar, tab strip) unless the page is opened
+// as an installed app. Ask for real fullscreen on the first tap where the
+// browser supports it; iOS home-screen mode uses the manifest instead.
+function enableMobileFullscreen() {
+  if (!window.isMobile) return;
+
+  const standalone =
+    (window.matchMedia &&
+      (window.matchMedia('(display-mode: standalone)').matches ||
+        window.matchMedia('(display-mode: fullscreen)').matches)) ||
+    window.navigator.standalone === true;
+  if (standalone) return;
+
+  const root = document.documentElement;
+  const request =
+    root.requestFullscreen ||
+    root.webkitRequestFullscreen ||
+    root.mozRequestFullScreen ||
+    root.msRequestFullscreen;
+  const supported =
+    document.fullscreenEnabled !== undefined
+      ? document.fullscreenEnabled
+      : document.webkitFullscreenEnabled;
+  if (!request || !supported) return;
+
+  let asked = false;
+  const enter = () => {
+    if (asked || document.fullscreenElement || document.webkitFullscreenElement) {
+      return;
+    }
+    asked = true;
+    try {
+      const result = request.call(root, { navigationUI: 'hide' });
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {
+          asked = false;
+        });
+      }
+    } catch (e) {
+      asked = false;
+    }
+  };
+
+  const opts = { once: true, passive: true, capture: true };
+  window.addEventListener('pointerup', enter, opts);
+  window.addEventListener('touchend', enter, opts);
+
+  document.addEventListener('fullscreenchange', () => {
+    resetUiHits();
+    fitCanvasToViewport();
+  });
 }
