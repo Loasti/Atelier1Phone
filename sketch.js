@@ -523,6 +523,10 @@ function createOtto(stats, x, y, maxHp = MAX_HP, assetIndex = null) {
     threatX: null,
     threatY: null,
     threatAt: 0,
+    chaseStartDist: 0,
+    chaseElapsed: 0,
+    chaseIgnoreId: null,
+    chaseIgnoreUntil: 0,
     dead: false,
     death: 0,
     energy: 0, // food eaten so far today; every Otto starts the day empty
@@ -1317,6 +1321,12 @@ function chooseIntent(o) {
   let enemyD = Infinity;
   for (const r of remote.values()) {
     if (r.hp <= 0) continue;
+    if (
+      o.chaseIgnoreId === r.id &&
+      simClock < o.chaseIgnoreUntil
+    ) {
+      continue;
+    }
     const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
     if (d <= st.sight + r.size * 0.6 && d < enemyD) {
       enemy = r;
@@ -1408,6 +1418,10 @@ function chooseIntent(o) {
   }
 
   if (enemy) {
+    if (!o.target || !o.target.foe || o.target.foe.id !== enemy.id) {
+      o.chaseStartDist = Math.hypot(enemy.x - o.pos.x, enemy.y - o.pos.y);
+      o.chaseElapsed = 0;
+    }
     o.mode = 'hunt';
     o.target = { x: enemy.x, y: enemy.y, foe: enemy };
     return;
@@ -1495,6 +1509,31 @@ function applyFriendlySteering(o, ux, uy) {
   return { x: sx, y: sy };
 }
 
+function updateChase(o, dt) {
+  const foe = o.target && o.target.foe;
+  if (!foe || !remote.has(foe.id) || foe.hp <= 0) return;
+
+  o.chaseElapsed += dt;
+  if (o.chaseElapsed < 1.0) return;
+
+  const d = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
+  const foeSpeed = numberOr(foe.speed, 2.5);
+  const faster = foeSpeed > o.stats.speed * 1.05;
+  const grown = d - o.chaseStartDist;
+
+  // A faster target that keeps pulling away is not worth chasing. A target
+  // that has gained a lot of ground is abandoned even if it is slower.
+  if ((faster && grown > 0.25) || grown > 0.8) {
+    o.chaseIgnoreId = foe.id;
+    o.chaseIgnoreUntil = simClock + 5;
+    o.mode = 'wander';
+    o.target = null;
+    o.wander = null;
+    o.think = 0;
+    o.chaseElapsed = 0;
+  }
+}
+
 function moveOtto(o, dt) {
   const st = o.stats;
   const t = o.target;
@@ -1533,6 +1572,7 @@ function moveOtto(o, dt) {
   if (o.mode === 'hunt') {
     fightIfTouching(o);
     keepBesideFoe(o);
+    updateChase(o, dt);
   }
 }
 
@@ -1605,6 +1645,8 @@ function fightIfTouching(o) {
   o.pos.y = foe.y + (ny / n) * out;
   o.pop = 1;
   o.wander = null;
+  o.chaseStartDist = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
+  o.chaseElapsed = 0;
 
   if (o.hp <= 0) {
     o.hp = 0;
@@ -1797,7 +1839,12 @@ function updateRemote(dt) {
       const have = Object.keys(votes).length;
       const majority = have > needed / 2;
 
-      if (majority) {
+      if (have >= needed) {
+        // Unanimous vote: resume immediately, no countdown.
+        paused = false;
+        localReady = false;
+        shared.pause = { active: false, day: dayNumber, votes: {} };
+      } else if (majority) {
         if (!p.resumeAt) {
           shared.pause = {
             active: true,
@@ -2083,6 +2130,10 @@ function storeOtto(o) {
   o.fightCd = 0;
   o.fleeThreat = null;
   o.fleeUntil = 0;
+  o.chaseIgnoreId = null;
+  o.chaseIgnoreUntil = 0;
+  o.chaseStartDist = 0;
+  o.chaseElapsed = 0;
   storedOtto = o;
   saveStoredOtto();
   dismissExamine();
@@ -2113,6 +2164,10 @@ function placeStoredOtto(fx, fy) {
   o.fightCd = 0;
   o.fleeThreat = null;
   o.fleeUntil = 0;
+  o.chaseIgnoreId = null;
+  o.chaseIgnoreUntil = 0;
+  o.chaseStartDist = 0;
+  o.chaseElapsed = 0;
   o.spawn = 0;
   o.dead = false;
   o.death = 0;
