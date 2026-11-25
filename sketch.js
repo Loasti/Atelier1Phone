@@ -1,12 +1,11 @@
 // Otto Field
-// An AR window into a tabletop world. Point the rear camera at a tabletop and
-// an Otto — the Otto1.gif sprite — anchors itself above the largest green
-// object in view. The green object is the origin of a small tabletop field:
-// food and other players' Ottos live in that field, and this Otto wanders,
-// eats, flees or hunts according to its six stats.
+// An AR window into a floor/tabletop world. Point the rear camera at a square
+// made of green tape: its four corners define the play area in perspective.
+// Food and other players' Ottos live inside that taped square, and this Otto
+// wanders, eats, flees or hunts according to its six stats.
 
-const SCAN_W = 160;
-const SCAN_H = 90;
+const SCAN_W = 240;
+const SCAN_H = 135;
 const SCAN_EVERY = 2;
 const MIN_BLOB = 0.0025; // smallest green blob, as a fraction of the scan frame
 
@@ -17,13 +16,13 @@ const SHARE_APP = 'my-project';
 // Transparent bounds around the creature inside the 360 × 360 GIF.
 const OTTO_CROP = { x: 109, y: 135, w: 135, h: 149 };
 
-// The tabletop field is measured in field units. The green marker is four
-// units across, so a 7 cm sticky note makes one unit about 1.75 cm. Sight,
-// speed and food distances are all in these units, which keeps the behaviour
-// physical: moving the phone closer scales the field, not the rules.
-const FIELD_UNITS_ACROSS = 8;
-const FIELD_TILT = 0.55; // vertical squash, so the field reads as a tabletop plane
-const FIELD_RADIUS = 20; // Ottos stay inside this radius, and inside the screen
+// The whole play area is the green tape square. Its four detected corners map
+// the unit square onto the floor in perspective, so every phone shares the
+// same taped boundary. Sight, speed and food distances use these field units.
+// 36 units across keeps roughly the old food/space density. Raise it for a
+// larger virtual world (smaller-looking Ottos), lower it for a cozier one.
+const FIELD_UNITS_ACROSS = 36;
+const FIELD_HALF = FIELD_UNITS_ACROSS / 2;
 const OTTO_UNITS_TALL = 3.2;
 const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
 const OTTO_COLLISION_SPACING = 0.9; // gentler per-frame spacing so food can be shared
@@ -411,8 +410,14 @@ function updateSharedDayClock(dt) {
 }
 
 function resetTracking() {
-  marker = { found: false, x: 0, y: 0, w: 0, h: 0, size: 0 };
-  field = { ok: false, x: 0, y: 0, px: 40, tx: 0, ty: 0, tpx: 40 };
+  marker = {
+    found: false,
+    corners: null,
+    center: { x: 0, y: 0 },
+    size: 0,
+    lastSeenAt: 0,
+  };
+  field = { ok: false, corners: null, M: null, invM: null };
   localFood = {};
   localFoodDay = 0;
 
@@ -554,17 +559,14 @@ function mutateStats(parent) {
   return out;
 }
 
-function maxOttoSize() {
-  let m = 1;
-  for (const o of ottos) m = Math.max(m, o.stats.size);
-  return m;
-}
-
 // --------------------------------------------------------------- examine view
 
 function ottoHit(o, x, y) {
   const p = fieldToScreen(o.pos.x, o.pos.y);
-  const h = OTTO_UNITS_TALL * o.stats.size * field.px;
+  const h =
+    OTTO_UNITS_TALL *
+    o.stats.size *
+    fieldScreenScale(o.pos.x, o.pos.y).avg;
   const cy = p.y - h * 0.5;
   const r = Math.max(20, h * 0.5);
   return Math.hypot(x - p.x, y - cy) < r;
@@ -572,7 +574,7 @@ function ottoHit(o, x, y) {
 
 function devOttoHit(r, x, y) {
   const p = fieldToScreen(r.x, r.y);
-  const h = OTTO_UNITS_TALL * r.size * field.px;
+  const h = OTTO_UNITS_TALL * r.size * fieldScreenScale(r.x, r.y).avg;
   const cy = p.y - h * 0.5;
   const rad = Math.max(20, h * 0.5);
   return Math.hypot(x - p.x, y - cy) < rad;
@@ -616,8 +618,12 @@ function startExamine(target, kind = 'local') {
   const py = isLocal ? target.pos.y : target.y;
   const startSize = isLocal ? target.stats.size : target.size;
   const p = fieldToScreen(px, py);
+  const groundScale = fieldScreenScale(px, py).avg;
   const targetHeight = Math.min(height * 0.34, width * 0.55);
-  const targetSize = Math.max(0.4, targetHeight / (OTTO_UNITS_TALL * Math.max(1, field.px)));
+  const targetSize = Math.max(
+    0.4,
+    targetHeight / (OTTO_UNITS_TALL * Math.max(1, groundScale))
+  );
   examineClone = {
     x: p.x,
     y: p.y,
@@ -628,6 +634,7 @@ function startExamine(target, kind = 'local') {
     targetX: width * 0.58,
     targetY: height * 0.5,
     targetSize,
+    scale: groundScale,
     facing: target.facing || 1,
     color,
     asset:
@@ -643,7 +650,7 @@ function spawnDevEnemy() {
   if (shareConnected) return;
   const n = nextDevId++;
   const a = Math.random() * Math.PI * 2;
-  const reach = Math.max(2, fieldLimit(1) * 0.55);
+  const reach = Math.max(2, fieldHalf() * 0.55);
   const r = 3 + Math.random() * reach;
   const entry = {
     id: 'dev#' + n,
@@ -732,7 +739,7 @@ function updateExamine(dt) {
 function drawExamineClone() {
   if (!examineClone) return;
   const c = examineClone;
-  drawOttoAt(c.x, c.y, c.size, 1, c.facing, 0, 1, c.color, c.asset);
+  drawOttoAt(c.x, c.y, c.size, 1, c.facing, 0, 1, c.color, c.asset, c.scale);
 }
 
 function drawStatsCard() {
@@ -927,14 +934,14 @@ function draw() {
   updateRemote(dt);
   updateExamine(dt);
 
-  if (marker.found && !fieldEntered) enterField();
+  if (field.ok && !fieldEntered) enterField();
 
   if (marker.found) {
     markerLost = 0;
     fieldLock += (1 - fieldLock) * (1 - Math.exp(-dt / 0.12));
   } else {
     markerLost += dt;
-    if (markerLost > 0.12) fieldLock *= Math.exp(-dt / 0.18);
+    if (markerLost > 0.25) fieldLock *= Math.exp(-dt / 0.45);
   }
 
   if (!paused) {
@@ -955,6 +962,7 @@ function draw() {
   }
 
   drawFood();
+  drawFieldBoundary();
   if (showField) drawFieldDebug();
   drawColonyRings();
   drawRemoteOttos();
@@ -984,6 +992,137 @@ function draw() {
 
 // ---------------------------------------------------------------- detection
 
+const MIN_QUAD_AREA = 0.015; // quadrilateral area as a fraction of the scan
+const MAX_QUAD_SIDE_RATIO = 6; // allow a fairly shallow camera angle
+const CORNER_REACQUIRE_MS = 1500;
+
+function cross2(o, a, b) {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+function convexHull(points) {
+  if (points.length < 3) return [];
+  const pts = points
+    .slice()
+    .sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
+  const lower = [];
+  for (const p of pts) {
+    while (
+      lower.length >= 2 &&
+      cross2(lower[lower.length - 2], lower[lower.length - 1], p) <= 0
+    ) {
+      lower.pop();
+    }
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (
+      upper.length >= 2 &&
+      cross2(upper[upper.length - 2], upper[upper.length - 1], p) <= 0
+    ) {
+      upper.pop();
+    }
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+// Peel the least-important hull vertex until only the four main corners remain.
+function simplifyHullToQuad(hull) {
+  const pts = hull.slice();
+  while (pts.length > 4) {
+    let removeAt = 0;
+    let smallest = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[(i + pts.length - 1) % pts.length];
+      const b = pts[i];
+      const c = pts[(i + 1) % pts.length];
+      const area = Math.abs(cross2(a, b, c)) * 0.5;
+      if (area < smallest) {
+        smallest = area;
+        removeAt = i;
+      }
+    }
+    pts.splice(removeAt, 1);
+  }
+  return pts.length === 4 ? pts : null;
+}
+
+function quadArea(points) {
+  let twice = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % points.length];
+    twice += a.x * b.y - b.x * a.y;
+  }
+  return Math.abs(twice) * 0.5;
+}
+
+function orderQuadClockwise(points) {
+  const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+  const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+  const sorted = points
+    .slice()
+    .sort(
+      (a, b) =>
+        Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
+    );
+
+  let start = 0;
+  let best = Infinity;
+  for (let i = 0; i < sorted.length; i++) {
+    const score = sorted[i].x + sorted[i].y;
+    if (score < best) {
+      best = score;
+      start = i;
+    }
+  }
+  return sorted.slice(start).concat(sorted.slice(0, start));
+}
+
+// Keep the same physical corner labelled as corner 0 while the phone moves.
+// A square has no intrinsic orientation, so this preserves continuity only
+// after the first lock.
+function matchCornerOrder(points) {
+  const prev = marker.corners;
+  if (
+    !prev ||
+    prev.length !== 4 ||
+    millis() - marker.lastSeenAt > CORNER_REACQUIRE_MS
+  ) {
+    return points;
+  }
+
+  let bestShift = 0;
+  let bestCost = Infinity;
+  for (let shift = 0; shift < 4; shift++) {
+    let cost = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = points[(i + shift) % 4];
+      const b = prev[i];
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      cost += dx * dx + dy * dy;
+    }
+    if (cost < bestCost) {
+      bestCost = cost;
+      bestShift = shift;
+    }
+  }
+
+  const reacquireDistance = Math.hypot(width, height) * 0.45;
+  if (bestCost / 4 > reacquireDistance * reacquireDistance) {
+    return points;
+  }
+  return points
+    .slice(bestShift)
+    .concat(points.slice(0, bestShift));
+}
+
 function scanForGreen() {
   const video = cam.video || cam.videoElement;
   if (!video) return;
@@ -1005,15 +1144,43 @@ function scanForGreen() {
     if (g > high * 1.1 && g - low > g * 0.2) mask[i] = 1;
   }
 
-  // Largest connected green blob wins. Everything else is noise on the table.
+  // Largest connected green blob wins. Keep its boundary so a taped square
+  // can be reduced to four corners instead of a screen-aligned bounding box.
+  const quad = findTapeQuad();
+  if (!quad) {
+    marker.found = false;
+    return;
+  }
+
+  const sideLengths = [];
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % 4];
+    sideLengths.push(Math.hypot(a.x - b.x, a.y - b.y));
+  }
+
+  // Map scan-buffer coordinates back into the camera's on-screen rectangle.
+  const dims = cam.getDimensions();
+  const screenCorners = quad.map((p) => ({
+    x: dims.x + ((p.x + 0.5) / SCAN_W) * dims.width,
+    y: dims.y + ((p.y + 0.5) / SCAN_H) * dims.height,
+  }));
+  marker.corners = matchCornerOrder(orderQuadClockwise(screenCorners));
+  marker.center = {
+    x: marker.corners.reduce((sum, p) => sum + p.x, 0) / 4,
+    y: marker.corners.reduce((sum, p) => sum + p.y, 0) / 4,
+  };
+  marker.size =
+    sideLengths.reduce((sum, side) => sum + side, 0) / sideLengths.length;
+  marker.lastSeenAt = millis();
+  marker.found = true;
+}
+
+function findTapeQuad() {
   visited.fill(0);
   let bestArea = 0;
-  let bestSx = 0;
-  let bestSy = 0;
-  let bestMinX = 0;
-  let bestMaxX = 0;
-  let bestMinY = 0;
-  let bestMaxY = 0;
+  let bestBoundary = null;
+  const compBoundary = [];
 
   for (let y = 0; y < SCAN_H; y++) {
     for (let x = 0; x < SCAN_W; x++) {
@@ -1024,27 +1191,22 @@ function scanForGreen() {
       let tail = 0;
       stack[tail++] = start;
       visited[start] = 1;
+      compBoundary.length = 0;
 
       let area = 0;
-      let sx = 0;
-      let sy = 0;
-      let minX = x;
-      let maxX = x;
-      let minY = y;
-      let maxY = y;
-
       while (head < tail) {
         const idx = stack[head++];
         const pxX = idx % SCAN_W;
         const pxY = (idx - pxX) / SCAN_W;
 
         area++;
-        sx += pxX;
-        sy += pxY;
-        if (pxX < minX) minX = pxX;
-        if (pxX > maxX) maxX = pxX;
-        if (pxY < minY) minY = pxY;
-        if (pxY > maxY) maxY = pxY;
+
+        let edge = false;
+        if (pxX === 0 || !mask[idx - 1]) edge = true;
+        else if (pxX === SCAN_W - 1 || !mask[idx + 1]) edge = true;
+        else if (pxY === 0 || !mask[idx - SCAN_W]) edge = true;
+        else if (pxY === SCAN_H - 1 || !mask[idx + SCAN_W]) edge = true;
+        if (edge) compBoundary.push({ x: pxX, y: pxY });
 
         if (pxX > 0) {
           const n = idx - 1;
@@ -1066,67 +1228,247 @@ function scanForGreen() {
 
       if (area > bestArea) {
         bestArea = area;
-        bestSx = sx / area;
-        bestSy = sy / area;
-        bestMinX = minX;
-        bestMaxX = maxX;
-        bestMinY = minY;
-        bestMaxY = maxY;
+        bestBoundary = compBoundary.slice();
       }
     }
   }
 
-  if (bestArea < SCAN_W * SCAN_H * MIN_BLOB) {
-    marker.found = false;
-    return;
+  if (!bestBoundary || bestArea < SCAN_W * SCAN_H * MIN_BLOB) {
+    return null;
   }
 
-  // Map scan-buffer coordinates back into the camera's on-screen rectangle.
-  const dims = cam.getDimensions();
-  marker.found = true;
-  marker.x = dims.x + ((bestSx + 0.5) / SCAN_W) * dims.width;
-  marker.y = dims.y + ((bestSy + 0.5) / SCAN_H) * dims.height;
-  marker.w = ((bestMaxX - bestMinX + 1) / SCAN_W) * dims.width;
-  marker.h = ((bestMaxY - bestMinY + 1) / SCAN_H) * dims.height;
-  marker.size = Math.sqrt(marker.w * marker.h);
+  const hull = convexHull(bestBoundary);
+  if (hull.length < 4) return null;
+
+  const quad = simplifyHullToQuad(hull);
+  if (!quad || quadArea(quad) < SCAN_W * SCAN_H * MIN_QUAD_AREA) {
+    return null;
+  }
+
+  const sideLengths = [];
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % 4];
+    sideLengths.push(Math.hypot(a.x - b.x, a.y - b.y));
+  }
+  const shortest = Math.min(...sideLengths);
+  const longest = Math.max(...sideLengths);
+  if (shortest < 4 || longest / shortest > MAX_QUAD_SIDE_RATIO) {
+    return null;
+  }
+
+  // A real taped square has green along all four sides. This rejects a
+  // U-shaped or broken piece of tape whose hull would otherwise invent a side.
+  if (!quadSidesVisible(quad)) return null;
+
+  return quad;
+}
+
+function quadSidesVisible(quad, tolerance = 3) {
+  const samples = 18;
+  for (let side = 0; side < 4; side++) {
+    const a = quad[side];
+    const b = quad[(side + 1) % 4];
+    let covered = 0;
+    for (let i = 1; i < samples; i++) {
+      const t = i / samples;
+      const sx = Math.round(a.x + (b.x - a.x) * t);
+      const sy = Math.round(a.y + (b.y - a.y) * t);
+      let hit = false;
+      for (let dy = -tolerance; dy <= tolerance && !hit; dy++) {
+        for (let dx = -tolerance; dx <= tolerance; dx++) {
+          const x = sx + dx;
+          const y = sy + dy;
+          if (
+            x >= 0 &&
+            x < SCAN_W &&
+            y >= 0 &&
+            y < SCAN_H &&
+            mask[y * SCAN_W + x]
+          ) {
+            hit = true;
+            break;
+          }
+        }
+      }
+      if (hit) covered++;
+    }
+    if (covered < Math.ceil((samples - 1) * 0.75)) return false;
+  }
+  return true;
 }
 
 // -------------------------------------------------------------------- field
 
-function updateField(dt) {
-  if (marker.found) {
-    field.tx = marker.x;
-    field.ty = marker.y;
-    field.tpx = marker.w / FIELD_UNITS_ACROSS;
+// Closed-form homography from the unit square to a screen quadrilateral.
+// Corner order is (0,0), (1,0), (1,1), (0,1).
+function quadHomography(corners) {
+  const p0 = corners[0];
+  const p1 = corners[1];
+  const p2 = corners[2];
+  const p3 = corners[3];
 
-    if (!field.ok) {
-      // First lock: snap straight to the marker instead of sliding in.
-      field.x = field.tx;
-      field.y = field.ty;
-      field.px = field.tpx;
-      field.ok = true;
-    }
+  const dx1 = p1.x - p2.x;
+  const dx2 = p3.x - p2.x;
+  const dx3 = p0.x - p1.x + p2.x - p3.x;
+  const dy1 = p1.y - p2.y;
+  const dy2 = p3.y - p2.y;
+  const dy3 = p0.y - p1.y + p2.y - p3.y;
+
+  let a, b, c, d, e, f, g, h;
+
+  if (Math.abs(dx3) < 1e-6 && Math.abs(dy3) < 1e-6) {
+    a = p1.x - p0.x;
+    b = p2.x - p1.x;
+    c = p0.x;
+    d = p1.y - p0.y;
+    e = p2.y - p1.y;
+    f = p0.y;
+    g = 0;
+    h = 0;
+  } else {
+    const den = dx1 * dy2 - dx2 * dy1;
+    if (Math.abs(den) < 1e-6) return null;
+    g = (dx3 * dy2 - dx2 * dy3) / den;
+    h = (dx1 * dy3 - dx3 * dy1) / den;
+    a = p1.x - p0.x + g * p1.x;
+    b = p3.x - p0.x + h * p3.x;
+    c = p0.x;
+    d = p1.y - p0.y + g * p1.y;
+    e = p3.y - p0.y + h * p3.y;
+    f = p0.y;
   }
-  if (!field.ok) return;
 
-  const kp = 1 - Math.exp(-dt / 0.09);
-  const ks = 1 - Math.exp(-dt / 0.16);
-  field.x = lerp(field.x, field.tx, kp);
-  field.y = lerp(field.y, field.ty, kp);
-  field.px = lerp(field.px, field.tpx, ks);
+  return [a, b, c, d, e, f, g, h, 1];
 }
 
-// The tabletop field has one fixed radius around the marker on every phone.
-// Screen edges no longer shrink it, so the rules are consistent across devices.
-function fieldLimit(size) {
-  return FIELD_RADIUS;
+function invert3x3(m) {
+  const a = m[0], b = m[1], c = m[2];
+  const d = m[3], e = m[4], f = m[5];
+  const g = m[6], h = m[7], i = m[8];
+
+  const A = e * i - f * h;
+  const B = f * g - d * i;
+  const C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  if (Math.abs(det) < 1e-9) return null;
+
+  const invDet = 1 / det;
+  return [
+    A * invDet,
+    (c * h - b * i) * invDet,
+    (b * f - c * e) * invDet,
+    B * invDet,
+    (a * i - c * g) * invDet,
+    (c * d - a * f) * invDet,
+    C * invDet,
+    (b * g - a * h) * invDet,
+    (a * e - b * d) * invDet,
+  ];
+}
+
+function updateFieldTransform() {
+  if (!field.corners || field.corners.length !== 4) {
+    field.ok = false;
+    return;
+  }
+  const matrix = quadHomography(field.corners);
+  const inverse = matrix ? invert3x3(matrix) : null;
+  if (!matrix || !inverse) {
+    field.ok = false;
+    return;
+  }
+  field.M = matrix;
+  field.invM = inverse;
+  field.ok = true;
+}
+
+function updateField(dt) {
+  if (!marker.found || !marker.corners || marker.corners.length !== 4) {
+    return;
+  }
+
+  if (!field.ok) {
+    // First lock: snap straight to the tape instead of sliding in.
+    field.corners = marker.corners.map((p) => ({ x: p.x, y: p.y }));
+  } else {
+    const k = 1 - Math.exp(-dt / 0.1);
+    for (let i = 0; i < 4; i++) {
+      field.corners[i].x = lerp(field.corners[i].x, marker.corners[i].x, k);
+      field.corners[i].y = lerp(field.corners[i].y, marker.corners[i].y, k);
+    }
+  }
+  updateFieldTransform();
 }
 
 function fieldToScreen(fx, fy) {
+  if (!field.ok || !field.M) {
+    return { x: width / 2, y: height / 2 };
+  }
+  const u = (fx + FIELD_HALF) / FIELD_UNITS_ACROSS;
+  const v = (fy + FIELD_HALF) / FIELD_UNITS_ACROSS;
+  const m = field.M;
+  const den = m[6] * u + m[7] * v + 1;
+  if (Math.abs(den) < 1e-6) return { x: width / 2, y: height / 2 };
   return {
-    x: field.x + fx * field.px,
-    y: field.y + fy * field.px * FIELD_TILT,
+    x: (m[0] * u + m[1] * v + m[2]) / den,
+    y: (m[3] * u + m[4] * v + m[5]) / den,
   };
+}
+
+function screenToField(sx, sy) {
+  if (!field.ok || !field.invM) return null;
+  const m = field.invM;
+  const den = m[6] * sx + m[7] * sy + m[8];
+  if (Math.abs(den) < 1e-6) return null;
+  const u = (m[0] * sx + m[1] * sy + m[2]) / den;
+  const v = (m[3] * sx + m[4] * sy + m[5]) / den;
+  return {
+    x: u * FIELD_UNITS_ACROSS - FIELD_HALF,
+    y: v * FIELD_UNITS_ACROSS - FIELD_HALF,
+  };
+}
+
+// Local screen size of one field unit at this point, including perspective.
+function fieldScreenScale(fx, fy) {
+  const p = fieldToScreen(fx, fy);
+  const px = fieldToScreen(fx + 1, fy);
+  const py = fieldToScreen(fx, fy + 1);
+  const sx = Math.hypot(px.x - p.x, px.y - p.y);
+  const sy = Math.hypot(py.x - p.x, py.y - p.y);
+  return {
+    x: Math.max(0.001, sx),
+    y: Math.max(0.001, sy),
+    avg: Math.max(0.001, Math.sqrt(sx * sy)),
+  };
+}
+
+function fieldGroundBasis(fx, fy) {
+  const p = fieldToScreen(fx, fy);
+  const px = fieldToScreen(fx + 1, fy);
+  const py = fieldToScreen(fx, fy + 1);
+  return {
+    x: p.x,
+    y: p.y,
+    ax: { x: px.x - p.x, y: px.y - p.y },
+    ay: { x: py.x - p.x, y: py.y - p.y },
+  };
+}
+
+function clampToField(x, y, margin = 0) {
+  const half = Math.max(0.1, FIELD_HALF - margin);
+  return { x: constrain(x, -half, half), y: constrain(y, -half, half) };
+}
+
+function clampOttoToField(o) {
+  const margin = Math.max(0.8, 1.5 * (o.stats.size || 1));
+  const p = clampToField(o.pos.x, o.pos.y, margin);
+  o.pos.x = p.x;
+  o.pos.y = p.y;
+}
+
+function fieldHalf() {
+  return FIELD_HALF;
 }
 
 function enterField() {
@@ -1157,8 +1499,6 @@ function updateBehaviour(dt, sync = true) {
       continue;
     }
 
-    const st = o.stats;
-
     o.fightCd = Math.max(0, o.fightCd - dt);
     o.spawn = Math.min(1, o.spawn + dt / 0.5);
     o.pop *= Math.exp(-dt / 0.18);
@@ -1174,13 +1514,8 @@ function updateBehaviour(dt, sync = true) {
 
     moveOtto(o, dt);
 
-    // Keep the Otto on the tabletop and inside the camera view.
-    const limit = fieldLimit(st.size);
-    const d = Math.hypot(o.pos.x, o.pos.y);
-    if (d > limit) {
-      o.pos.x = (o.pos.x / d) * limit;
-      o.pos.y = (o.pos.y / d) * limit;
-    }
+    // Keep the Otto inside the taped square.
+    clampOttoToField(o);
   }
 
   // Keep only this phone's own Ottos from overlapping. Remote colonies are a
@@ -1304,14 +1639,7 @@ function separateOttos(rounds = 6, spacing = OTTO_SPACING) {
       }
     }
 
-    for (const o of ottos) {
-      const limit = fieldLimit(o.stats.size);
-      const d = Math.hypot(o.pos.x, o.pos.y);
-      if (d > limit) {
-        o.pos.x = (o.pos.x / d) * limit;
-        o.pos.y = (o.pos.y / d) * limit;
-      }
-    }
+    for (const o of ottos) clampOttoToField(o);
 
     if (!moved) break;
   }
@@ -1447,14 +1775,14 @@ function chooseIntent(o) {
     if (threatRecent) {
       const away = Math.atan2(o.pos.y - o.threatY, o.pos.x - o.threatX);
       const a = away + (Math.random() * 2 - 1) * Math.PI * 0.45;
-      const r = 2 + Math.random() * Math.min(6, fieldLimit(st.size) * 0.5);
+      const r = 2 + Math.random() * Math.min(6, fieldHalf() * 0.5);
       o.wander = {
         x: o.pos.x + Math.cos(a) * r,
         y: o.pos.y + Math.sin(a) * r,
       };
     } else {
       const a = Math.random() * Math.PI * 2;
-      const r = 1 + Math.random() * Math.min(8, fieldLimit(st.size) * 0.6);
+      const r = 1 + Math.random() * Math.min(8, fieldHalf() * 0.6);
       o.wander = { x: Math.cos(a) * r, y: Math.sin(a) * r };
     }
   }
@@ -1703,13 +2031,11 @@ function updateFood(dt) {
 
 function seedFood(store, howMany) {
   let count = Object.keys(store).length;
+  const half = Math.max(1, FIELD_HALF - FOOD_RADIUS - 0.8);
   for (let i = 0; i < howMany && count < FOOD_MAX; i++, count++) {
-    const a = Math.random() * Math.PI * 2;
-    const reach = Math.min(FIELD_RADIUS * 0.75, fieldLimit(maxOttoSize()) * 0.75);
-    const r = 1.5 + Math.random() * reach;
     store['f' + Math.floor(Math.random() * 1e9)] = {
-      x: Math.round(Math.cos(a) * r * 100) / 100,
-      y: Math.round(Math.sin(a) * r * 100) / 100,
+      x: Math.round((Math.random() * 2 - 1) * half * 100) / 100,
+      y: Math.round((Math.random() * 2 - 1) * half * 100) / 100,
       amount: FOOD_AMOUNT,
     };
   }
@@ -2152,15 +2478,14 @@ function storeOtto(o) {
 function placeStoredOtto(fx, fy) {
   if (!storedOtto) return;
   const o = storedOtto;
-  const limit = fieldLimit(o.stats.size);
-  const d = Math.hypot(fx, fy);
-  if (d > limit) {
-    fx = (fx / d) * limit;
-    fy = (fy / d) * limit;
-  }
+  const p = clampToField(
+    fx,
+    fy,
+    Math.max(0.8, 1.5 * (o.stats.size || 1))
+  );
 
-  o.pos.x = fx;
-  o.pos.y = fy;
+  o.pos.x = p.x;
+  o.pos.y = p.y;
   o.mode = 'wander';
   o.moving = false;
   o.target = null;
@@ -2438,8 +2763,8 @@ function drawPlacementPrompt() {
   const msg = !window.cameraEnabled
     ? 'TAP TO START THE CAMERA'
     : field.ok && fieldLock > 0.05
-    ? 'TAP THE TABLE TO PLACE YOUR OTTO'
-    : 'SHOW THE GREEN MARKER TO PLACE YOUR OTTO';
+    ? 'TAP INSIDE THE TAPE TO PLACE YOUR OTTO'
+    : 'SHOW THE GREEN TAPE SQUARE TO PLACE YOUR OTTO';
   textAlign(CENTER, CENTER);
   textSize(s * 0.8);
   const w = textWidth(msg) + 36;
@@ -2770,9 +3095,9 @@ function ottoFillFor(asset, frame, color) {
   return set[index] || set[0] || null;
 }
 
-function drawColonyRing(ctx, cx, groundY, w, h, alpha, color) {
+function drawColonyRing(ctx, cx, groundY, w, h, alpha, color, aspect = 1) {
   const rx = Math.max(8, w * 0.36);
-  const ry = rx * FIELD_TILT;
+  const ry = rx * aspect;
 
   ctx.save();
   ctx.fillStyle = rgbColor(color);
@@ -2805,9 +3130,20 @@ function drawColonyRings() {
     const alpha = fieldLock * o.spawn * fade;
     if (alpha < 0.01) continue;
     const p = fieldToScreen(o.pos.x, o.pos.y);
-    const h = OTTO_UNITS_TALL * o.stats.size * field.px * (1 + o.pop * 0.1);
+    const scale = fieldScreenScale(o.pos.x, o.pos.y);
+    const h =
+      OTTO_UNITS_TALL * o.stats.size * scale.avg * (1 + o.pop * 0.1);
     const w = h * (OTTO_CROP.w / OTTO_CROP.h);
-    drawColonyRing(ctx, p.x, p.y, w, h, alpha, localColor);
+    drawColonyRing(
+      ctx,
+      p.x,
+      p.y,
+      w,
+      h,
+      alpha,
+      localColor,
+      scale.y / scale.x
+    );
   }
 
   for (const r of remote.values()) {
@@ -2817,9 +3153,19 @@ function drawColonyRings() {
     const alpha = r.lock * fade;
     if (alpha < 0.01) continue;
     const p = fieldToScreen(r.x, r.y);
-    const h = OTTO_UNITS_TALL * r.size * field.px;
+    const scale = fieldScreenScale(r.x, r.y);
+    const h = OTTO_UNITS_TALL * r.size * scale.avg;
     const w = h * (OTTO_CROP.w / OTTO_CROP.h);
-    drawColonyRing(ctx, p.x, p.y, w, h, alpha, r.dev ? r.color : colonyColorFor(r.client));
+    drawColonyRing(
+      ctx,
+      p.x,
+      p.y,
+      w,
+      h,
+      alpha,
+      r.dev ? r.color : colonyColorFor(r.client),
+      scale.y / scale.x
+    );
   }
 }
 
@@ -2842,7 +3188,8 @@ function drawLocalOttos() {
       o.pop,
       o.hp / (o.maxHp || MAX_HP),
       color,
-      o.assetIndex == null ? ottoAssetFor(o.id) : ottoAssets[o.assetIndex] || ottoAssetFor(o.id)
+      o.assetIndex == null ? ottoAssetFor(o.id) : ottoAssets[o.assetIndex] || ottoAssetFor(o.id),
+      fieldScreenScale(o.pos.x, o.pos.y).avg
     );
   }
 }
@@ -2867,7 +3214,8 @@ function drawRemoteOttos() {
       0,
       r.hp / (r.maxHp || MAX_HP),
       r.dev ? r.color : colonyColorFor(r.client),
-      r.assetIndex == null ? ottoAssetFor(r.id) : ottoAssets[r.assetIndex] || ottoAssetFor(r.id)
+      r.assetIndex == null ? ottoAssetFor(r.id) : ottoAssets[r.assetIndex] || ottoAssetFor(r.id),
+      fieldScreenScale(r.x, r.y).avg
     );
   }
 }
@@ -2931,11 +3279,13 @@ function drawOttoAt(
   pop,
   hpFrac = 1,
   color = COLONY_COLORS[0],
-  asset = null
+  asset = null,
+  groundScale = 1
 ) {
   const art = asset || ottoAssets[0];
   if (!art) return;
-  const h = OTTO_UNITS_TALL * size * field.px * (1 + pop * 0.1);
+  const h =
+    OTTO_UNITS_TALL * size * Math.max(0.001, groundScale) * (1 + pop * 0.1);
   const w = h * (OTTO_CROP.w / OTTO_CROP.h);
   const ctx = drawingContext;
 
@@ -2998,6 +3348,38 @@ function drawOttoAt(
   ctx.restore();
 }
 
+function drawFieldBoundary() {
+  if (!field.ok || fieldLock < 0.01) return;
+  const h = FIELD_HALF;
+  const corners = [
+    fieldToScreen(-h, -h),
+    fieldToScreen(h, -h),
+    fieldToScreen(h, h),
+    fieldToScreen(-h, h),
+  ];
+  const ctx = drawingContext;
+
+  ctx.save();
+  ctx.globalAlpha = fieldLock * 0.24;
+  ctx.strokeStyle = 'rgba(126, 255, 190, 0.9)';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(corners[0].x, corners[0].y);
+  for (let i = 1; i < 4; i++) {
+    ctx.lineTo(corners[i].x, corners[i].y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(240, 255, 250, 0.9)';
+  for (const p of corners) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawFood() {
   if (!field.ok) return;
   const store = currentFood();
@@ -3011,18 +3393,18 @@ function drawFood() {
     const f = store[id];
     if (!f || typeof f.x !== 'number') continue;
 
-    const p = fieldToScreen(f.x, f.y);
-    const r = Math.max(3, FOOD_RADIUS * field.px);
+    const g = fieldGroundBasis(f.x, f.y);
+    const det = g.ax.x * g.ay.y - g.ax.y * g.ay.x;
+    if (Math.abs(det) < 1e-3) continue;
 
     ctx.save();
-    ctx.translate(p.x, p.y);
-    ctx.scale(1, FIELD_TILT);
+    ctx.transform(g.ax.x, g.ax.y, g.ay.x, g.ay.y, g.x, g.y);
     ctx.fillStyle = 'rgba(255, 196, 92, 0.9)';
     ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.arc(0, 0, FOOD_RADIUS, 0, Math.PI * 2);
     ctx.fill();
     ctx.strokeStyle = 'rgba(255, 238, 196, 0.7)';
-    ctx.lineWidth = Math.max(1, r * 0.16);
+    ctx.lineWidth = Math.max(0.12, FOOD_RADIUS * 0.22);
     ctx.stroke();
     ctx.restore();
   }
@@ -3033,7 +3415,7 @@ function drawFieldDebug() {
   if (!field.ok) return;
 
   const ctx = drawingContext;
-  const lim = fieldLimit(maxOttoSize());
+  const lim = FIELD_HALF;
 
   ctx.save();
   ctx.strokeStyle = 'rgba(126, 255, 190, 0.14)';
@@ -3056,8 +3438,9 @@ function drawFieldDebug() {
 
   for (const o of ottos) {
     const p = fieldToScreen(o.pos.x, o.pos.y);
-    const rx = o.stats.sight * field.px;
-    const ry = rx * FIELD_TILT;
+    const scale = fieldScreenScale(o.pos.x, o.pos.y);
+    const rx = o.stats.sight * scale.x;
+    const ry = o.stats.sight * scale.y;
     ctx.strokeStyle = 'rgba(126, 255, 190, 0.55)';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -3093,7 +3476,7 @@ function drawHud() {
   text('OTTO FIELD', 18, 16);
   fill(120, 220, 255, 150);
   textSize(s * 0.72);
-  text('GREEN-MARKER FIELD', 18, 16 + s * 1.55);
+  text('GREEN TAPE FIELD', 18, 16 + s * 1.55);
 
   // Room state.
   let roomText = 'CONNECTING TO SHARED SPACE...';
@@ -3135,7 +3518,7 @@ function drawHud() {
         } · OTTOS ${ottos.length} · DAY ${dayNumber}`
       : fieldEntered
       ? 'COLONY LOST · RELOAD TO BEGIN AGAIN'
-      : 'NO OTTO YET · SHOW IT A GREEN OBJECT',
+      : 'NO OTTO YET · SHOW IT THE GREEN TAPE SQUARE',
     18,
     16 + s * 4.05
   );
@@ -3297,7 +3680,7 @@ function drawHud() {
     textAlign(CENTER, BOTTOM);
     fill(205, 232, 245, 180);
     textSize(s * 0.8);
-    text('POINT AT A GREEN OBJECT ON THE TABLE', width / 2, height - 20);
+    text('POINT AT THE FULL GREEN TAPE SQUARE', width / 2, height - 20);
   }
 
   pop();
@@ -3519,22 +3902,21 @@ function mousePressed() {
 
   if (placementActive) {
     if (field.ok && fieldLock > 0.05) {
-      let fx = (mouseX - field.x) / field.px;
-      let fy = (mouseY - field.y) / (field.px * FIELD_TILT);
+      const tap = screenToField(mouseX, mouseY);
+      if (!tap) return false;
+      const spot = clampToField(
+        tap.x,
+        tap.y,
+        Math.max(0.8, 1.5 * (pendingStats ? pendingStats.size : 1))
+      );
 
       if (placementMode === 'stored') {
-        placeStoredOtto(fx, fy);
+        placeStoredOtto(spot.x, spot.y);
       } else {
-        const limit = fieldLimit(pendingStats.size);
-        const d = Math.hypot(fx, fy);
-        if (d > limit) {
-          fx = (fx / d) * limit;
-          fy = (fy / d) * limit;
-        }
         const placed = createOtto(
           pendingStats,
-          fx,
-          fy,
+          spot.x,
+          spot.y,
           pendingMaxHp,
           pendingAssetIndex
         );
