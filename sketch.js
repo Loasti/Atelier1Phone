@@ -153,6 +153,29 @@ let spawnHit = null;
 let devHits = [];
 let nextDevId = 1;
 
+// Lobby: allocation and placement.
+let allocationActive = false;
+let allocationPoints = {
+  attack: 0,
+  speed: 0,
+  size: 0,
+  sight: 0,
+  aggression: 0,
+  hp: 0,
+};
+let allocationRemaining = 10;
+let allocationHits = [];
+let allocationConfirmHit = null;
+let colorHits = [];
+let teamColorIndex = 0;
+let pendingStats = null;
+let pendingMaxHp = MAX_HP;
+let placementActive = false;
+let colonySpawned = false;
+let colonyLost = false;
+let reconnectHit = null;
+let failRetryHit = null;
+
 async function setup() {
   createCanvas(windowWidth, windowHeight);
   pixelDensity(min(2, displayDensity()));
@@ -170,6 +193,7 @@ async function setup() {
     me: {
       name: 'Otto',
       ottos: [],
+      colorIndex: 0,
     },
   });
 
@@ -197,6 +221,16 @@ async function setup() {
   cam = createPhoneCamera('environment', false, 'cover');
   enableCameraTap('TAP TO ENTER THE OTTO FIELD');
   showDesktopQr({ label: 'Scan to open on your phone' });
+
+  // Solo mode is gone; join the shared room automatically.
+  if (typeof shareConnect === 'function' && !shareConnected && shareStatus !== 'connecting') {
+    try {
+      const p = shareConnect();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (e) {
+      // The reconnect screen will pick this up.
+    }
+  }
 }
 
 function shareReady() {
@@ -212,6 +246,13 @@ function shareReady() {
   if (typeof shared.dayElapsed !== 'number') shared.dayElapsed = 0;
   if (typeof shared.foodSeedDay !== 'number') shared.foodSeedDay = 0;
   if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
+  if (typeof shared.started !== 'boolean') shared.started = false;
+
+  // No colony yet: start the local create/place flow. Late joiners also get
+  // this flow while the shared day clock keeps running.
+  if (!colonySpawned && ottos.length === 0 && !placementActive) {
+    allocationActive = true;
+  }
 
   // Adopt the room's current day and clock instead of starting fresh.
   dayNumber = shared.day;
@@ -261,6 +302,15 @@ function updateSharedDayClock(dt) {
   const leader = isDayLeader();
   const now = millis() / 1000;
   const sharedPaused = !!(shared.pause && shared.pause.active);
+
+  // The room clock waits for the first Otto to be placed.
+  if (!shared.started) {
+    dayClock = 0;
+    lastElapsedAt = now;
+    wasPausedForClock = true;
+    wasDayLeader = leader;
+    return;
+  }
 
   // Adopt a day change from the room, and run this colony's end-of-day work
   // exactly once for that shared day.
@@ -344,7 +394,7 @@ function resetTracking() {
   localFoodDay = 0;
 
   nextOttoId = 1;
-  ottos = [createOtto(defaultStats(), 0, 0)];
+  ottos = [];
   fieldEntered = false;
   fieldLock = 0;
   markerLost = 0;
@@ -371,6 +421,27 @@ function resetTracking() {
   spawnHit = null;
   devHits = [];
   nextDevId = 1;
+  allocationActive = false;
+  allocationPoints = {
+    attack: 0,
+    speed: 0,
+    size: 0,
+    sight: 0,
+    aggression: 0,
+    hp: 0,
+  };
+  allocationRemaining = 10;
+  allocationHits = [];
+  allocationConfirmHit = null;
+  colorHits = [];
+  teamColorIndex = 0;
+  pendingStats = null;
+  pendingMaxHp = MAX_HP;
+  placementActive = false;
+  colonySpawned = false;
+  colonyLost = false;
+  reconnectHit = null;
+  failRetryHit = null;
 }
 
 function defaultStats() {
@@ -383,17 +454,34 @@ function defaultStats() {
   };
 }
 
+function statsFromAllocation(points) {
+  const base = defaultStats();
+  return {
+    attack: base.attack + points.attack,
+    speed: base.speed + points.speed * 0.1,
+    size: base.size + points.size * 0.1,
+    sight: base.sight + points.sight,
+    aggression: base.aggression + points.aggression,
+  };
+}
+
+function maxHpFromAllocation(points) {
+  return MAX_HP + points.hp * 10;
+}
+
 // Daily energy cost is a pure function of Size, so it cannot be edited or
 // passed down directly. Every other system asks for it here.
 function energyRequirementFor(size) {
   return Math.max(5, Math.round(ENERGY_PER_SIZE * size));
 }
 
-function createOtto(stats, x, y) {
+function createOtto(stats, x, y, maxHp = MAX_HP) {
   const st = stats || defaultStats();
   return {
     id: nextOttoId++,
     pos: { x: x || 0, y: y || 0 },
+    maxHp,
+    hp: maxHp,
     facing: 1,
     moving: false,
     pop: 0,
@@ -408,7 +496,6 @@ function createOtto(stats, x, y) {
     threatX: null,
     threatY: null,
     threatAt: 0,
-    hp: MAX_HP,
     dead: false,
     death: 0,
     energy: 0, // food eaten so far today; every Otto starts the day empty
@@ -468,12 +555,14 @@ function startExamine(target, kind = 'local') {
       id: target.id,
       stats: { ...target.stats },
       hp: target.hp,
+      maxHp: target.maxHp || MAX_HP,
       energy: target.energy,
       color,
     };
   } else {
     examineSnapshot = {
       id: target.id,
+      maxHp: target.maxHp || MAX_HP,
       stats: {
         attack: target.attack,
         speed: target.speed || 2.5,
@@ -531,6 +620,7 @@ function spawnDevEnemy() {
     aggression: 6 + Math.floor(Math.random() * 10),
     sight: 6 + Math.floor(Math.random() * 8),
     hp: MAX_HP,
+    maxHp: MAX_HP,
     credited: false,
     deadTime: 0,
     facing: 1,
@@ -547,7 +637,11 @@ function adjustDevStat(key, dir) {
   const step = key === 'hp' ? 5 : def ? def.step : 1;
 
   if (key === 'hp') {
-    examineRef.hp = constrain(Math.round(examineRef.hp + dir * step), 1, MAX_HP);
+    examineRef.hp = constrain(
+      Math.round(examineRef.hp + dir * step),
+      1,
+      examineRef.maxHp || MAX_HP
+    );
   } else if (isLocal) {
     let v = examineRef.stats[key] + dir * step;
     v = def.min + Math.round((v - def.min) / def.step) * def.step;
@@ -624,6 +718,7 @@ function drawStatsCard() {
         }
     : snap.stats;
   const hp = refUsable ? ref.hp : snap.hp;
+  const maxHp = (refUsable && ref.maxHp) || snap.maxHp || MAX_HP;
   const energy = refUsable && isLocal ? ref.energy : snap.energy;
   const id = snap.id;
   const need = energyRequirementFor(st.size);
@@ -716,7 +811,7 @@ function drawStatsCard() {
       ['SIGHT', st.sight.toFixed(0)],
       ['AGGRESSION', st.aggression],
       ['ENERGY/DAY', need],
-      ['HP', `${Math.max(0, Math.round(hp))}/${MAX_HP}`],
+      ['HP', `${Math.max(0, Math.round(hp))}/${maxHp}`],
       ['ENERGY', Math.round(energy)],
     ];
 
@@ -758,6 +853,7 @@ function draw() {
 
   if (!live) {
     drawWaiting(now);
+    drawLobbyOverlays();
     return;
   }
 
@@ -808,7 +904,12 @@ function draw() {
   drawStatsCard();
   drawHud();
   if (panel.open) drawPanel();
-  drawPauseOverlay();
+
+  if (colonySpawned && ottos.length === 0 && !allocationActive && !placementActive) {
+    colonyLost = true;
+  }
+  drawLobbyOverlays();
+  if (shareConnected) drawPauseOverlay();
 }
 
 // ---------------------------------------------------------------- detection
@@ -1016,14 +1117,6 @@ function updateBehaviour(dt, sync = true) {
   // different team, so they are intentionally left alone. The per-frame radius
   // is smaller than the post-reproduction one so two Ottos can share food.
   separateOttos(1, OTTO_COLLISION_SPACING);
-
-  if (!shareConnected) {
-    dayClock += dt;
-    if (dayClock >= DAY_SECONDS) {
-      dayClock = 0;
-      endOfDay();
-    }
-  }
 
   // Remove Ottos once their death fade has played out.
   for (let i = ottos.length - 1; i >= 0; i--) {
@@ -1484,24 +1577,16 @@ function currentFood() {
 // Food is reset once per day: 30 fresh pieces in random positions. There is no
 // continuous timer-based topping up anymore.
 function updateFood(dt) {
-  if (paused) return;
+  if (paused || !shareConnected || !shared.started) return;
 
-  if (shareConnected) {
-    // Only the day leader seeds, so multiple phones cannot overwrite the
-    // room's food layout.
-    if (!isDayLeader()) return;
-    if (shared.foodSeedDay === shared.day) return;
-    const fresh = {};
-    seedFood(fresh, FOOD_PER_DAY);
-    shared.food = fresh;
-    shared.foodSeedDay = shared.day;
-  } else {
-    if (localFoodDay === dayNumber) return;
-    const fresh = {};
-    seedFood(fresh, FOOD_PER_DAY);
-    localFood = fresh;
-    localFoodDay = dayNumber;
-  }
+  // Only the day leader seeds, so multiple phones cannot overwrite the
+  // room's food layout.
+  if (!isDayLeader()) return;
+  if (shared.foodSeedDay === shared.day) return;
+  const fresh = {};
+  seedFood(fresh, FOOD_PER_DAY);
+  shared.food = fresh;
+  shared.foodSeedDay = shared.day;
 }
 
 function seedFood(store, howMany) {
@@ -1534,9 +1619,11 @@ function syncMe() {
       y: Math.round(o.pos.y * 100) / 100,
       size: Math.round(o.stats.size * 100) / 100,
       attack: o.stats.attack,
+      speed: o.stats.speed,
       aggression: o.stats.aggression,
       sight: o.stats.sight,
       hp: Math.max(0, Math.round(o.hp)),
+      maxHp: Math.max(1, Math.round(o.maxHp || MAX_HP)),
     });
   }
   me.ottos = list;
@@ -1573,9 +1660,11 @@ function updateRemote(dt) {
             ty: data.y,
             size: 1,
             attack: 10,
+            speed: 2.5,
             aggression: 10,
             sight: 8,
             hp: MAX_HP,
+            maxHp: MAX_HP,
             credited: false,
             deadTime: 0,
             facing: 1,
@@ -1588,9 +1677,11 @@ function updateRemote(dt) {
         r.ty = data.y;
         r.size = numberOr(data.size, 1);
         r.attack = numberOr(data.attack, 10);
+        r.speed = numberOr(data.speed, 2.5);
         r.aggression = numberOr(data.aggression, 10);
         r.sight = numberOr(data.sight, 8);
         r.hp = numberOr(data.hp, MAX_HP);
+        r.maxHp = numberOr(data.maxHp, MAX_HP);
 
         // The loser's phone broadcasts hp 0 for a short death linger. The
         // nearby living Otto on this phone is the victor and claims the food.
@@ -1767,6 +1858,290 @@ function drawPauseOverlay() {
   pop();
 }
 
+function resetAllocation() {
+  allocationPoints = {
+    attack: 0,
+    speed: 0,
+    size: 0,
+    sight: 0,
+    aggression: 0,
+    hp: 0,
+  };
+  allocationRemaining = 10;
+  allocationActive = true;
+  allocationHits = [];
+  allocationConfirmHit = null;
+  colorHits = [];
+  teamColorIndex = 0;
+  pendingStats = null;
+  pendingMaxHp = MAX_HP;
+  placementActive = false;
+  colonySpawned = false;
+  colonyLost = false;
+  examineClone = null;
+  examineRef = null;
+  examineSnapshot = null;
+  examineT = 0;
+  examineLeaving = false;
+}
+
+function adjustAllocation(key, dir) {
+  if (dir < 0) {
+    if (allocationPoints[key] <= 0) return;
+    allocationPoints[key] -= 1;
+    allocationRemaining += 1;
+  } else {
+    if (allocationRemaining <= 0) return;
+    allocationPoints[key] += 1;
+    allocationRemaining -= 1;
+  }
+}
+
+function drawConnectionScreen() {
+  if (shareConnected) return;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 235);
+  rect(0, 0, width, height);
+  textAlign(CENTER, CENTER);
+  fill(240, 252, 255, 235);
+  textSize(constrain(width * 0.07, 20, 38));
+  const connecting = shareStatus === 'connecting';
+  text(connecting ? 'JOINING SHARED SPACE…' : 'SHARED SPACE DISCONNECTED', width / 2, height * 0.42);
+  fill(180, 220, 240, 190);
+  textSize(constrain(width * 0.035, 11, 16));
+  text(
+    connecting ? 'Keep the app open.' : 'Solo play is no longer available.',
+    width / 2,
+    height * 0.5
+  );
+
+  reconnectHit = null;
+  if (!connecting) {
+    const bw = Math.min(width - 60, 280);
+    const bh = 54;
+    const bx = width / 2 - bw / 2;
+    const by = height * 0.58;
+    reconnectHit = { x: bx, y: by, w: bw, h: bh };
+    noFill();
+    stroke(140, 230, 255, 120);
+    strokeWeight(1);
+    rect(bx, by, bw, bh, bh / 2);
+    noStroke();
+    fill(150, 235, 255, 220);
+    textSize(15);
+    text('RECONNECT', width / 2, by + bh / 2 + 1);
+  } else {
+    reconnectHit = null;
+  }
+  pop();
+}
+
+function drawAllocationScreen() {
+  const s = constrain(width * 0.031, 10, 16);
+  const panelW = Math.min(width - 30, 430);
+  const panelH = Math.min(height - 50, 560);
+  const panelX = (width - panelW) / 2;
+  const panelY = (height - panelH) / 2;
+  allocationHits = [];
+  colorHits = [];
+  allocationConfirmHit = null;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 238);
+  rect(0, 0, width, height);
+
+  fill(240, 252, 255, 240);
+  textAlign(LEFT, TOP);
+  textSize(s * 1.15);
+  text('CREATE YOUR OTTO', panelX + 18, panelY + 16);
+  fill(126, 255, 190, 220);
+  textSize(s * 0.8);
+  text(`${allocationRemaining} POINTS LEFT`, panelX + 18, panelY + 16 + s * 1.6);
+
+  // Close-up preview of the Otto being created.
+  const previewBox = Math.min(140, panelH * 0.26);
+  const previewBottom = panelY + 52 + previewBox;
+  const previewH = constrain(100 + allocationPoints.size * 5, 90, previewBox - 8);
+  const previewCx = panelX + panelW / 2;
+
+  fill(255, 255, 255, 18);
+  ellipse(previewCx, previewBottom, previewH * 1.1, previewH * 0.3);
+  drawOttoPreview(
+    previewCx,
+    previewBottom,
+    previewH,
+    COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0],
+    ottoAssetFor(nextOttoId)
+  );
+
+  // Team colour picker.
+  const colorY = previewBottom + 16;
+  fill(150, 200, 225, 180);
+  textAlign(LEFT, CENTER);
+  textSize(s * 0.55);
+  text('TEAM COLOUR', panelX + 18, colorY);
+  const swatches = COLONY_COLORS.length;
+  const gap = (panelW - 36) / swatches;
+  const swR = Math.min(9, gap * 0.32);
+  const swCy = colorY + Math.max(16, swR + 8);
+  for (let i = 0; i < swatches; i++) {
+    const cx = panelX + 18 + gap * (i + 0.5);
+    noStroke();
+    fill(COLONY_COLORS[i][0], COLONY_COLORS[i][1], COLONY_COLORS[i][2], 230);
+    circle(cx, swCy, swR * 2);
+    if (i === teamColorIndex) {
+      noFill();
+      stroke(255, 255, 255, 220);
+      strokeWeight(2);
+      circle(cx, swCy, swR * 2 + 7);
+      noStroke();
+    }
+    colorHits.push({
+      x: cx - swR - 5,
+      y: swCy - swR - 5,
+      w: swR * 2 + 10,
+      h: swR * 2 + 10,
+      index: i,
+    });
+  }
+
+  const keys = ['attack', 'speed', 'size', 'sight', 'aggression', 'hp'];
+  const labels = ['ATTACK', 'SPEED', 'SIZE', 'SIGHT', 'AGGRESSION', 'HP'];
+  const base = defaultStats();
+  const confirmH = s * 2.6;
+  const confirmY = panelY + panelH - confirmH - 18;
+  const startY = swCy + swR + 18;
+  const rowH = Math.min(s * 2.4, (confirmY - 14 - startY) / 6);
+
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const y = startY + i * rowH;
+    const points = allocationPoints[key];
+    let value;
+    if (key === 'hp') value = `${MAX_HP + points * 10}`;
+    else if (key === 'speed') value = (base.speed + points * 0.1).toFixed(1);
+    else if (key === 'size') value = (base.size + points * 0.1).toFixed(2);
+    else value = String(base[key] + points);
+
+    fill(170, 215, 235, 190);
+    textAlign(LEFT, CENTER);
+    textSize(s * 0.61);
+    text(labels[i], panelX + 18, y + rowH * 0.35);
+    fill(240, 252, 255, 230);
+    textAlign(RIGHT, CENTER);
+    text(value, panelX + panelW - s * 8.0, y + rowH * 0.35);
+    fill(126, 255, 190, 190);
+    textSize(s * 0.52);
+    text(`+${points}`, panelX + panelW - s * 6.0, y + rowH * 0.35);
+
+    const bw = s * 2.4;
+    const bh = Math.min(s * 1.6, rowH * 0.72);
+    const by = y + rowH * 0.35 - bh / 2;
+    const minusX = panelX + panelW - s * 5.0;
+    const plusX = panelX + panelW - s * 2.4;
+
+    for (const [bx, label, dir] of [
+      [minusX, '−', -1],
+      [plusX, '+', 1],
+    ]) {
+      const active = dir < 0 ? points > 0 : allocationRemaining > 0;
+      noFill();
+      stroke(active ? color(140, 230, 255, 120) : color(80, 100, 115, 80));
+      strokeWeight(1);
+      rect(bx, by, bw, bh, bh / 2);
+      noStroke();
+      fill(active ? color(150, 235, 255, 220) : color(100, 120, 135, 120));
+      textAlign(CENTER, CENTER);
+      textSize(s * 0.8);
+      text(label, bx + bw / 2, by + bh / 2 + 1);
+      if (active) allocationHits.push({ x: bx, y: by, w: bw, h: bh, key, dir });
+    }
+  }
+
+  const bw = panelW - 36;
+  const bh = confirmH;
+  const bx = panelX + 18;
+  const by = confirmY;
+  const ready = allocationRemaining === 0;
+  allocationConfirmHit = { x: bx, y: by, w: bw, h: bh, enabled: ready };
+
+  noFill();
+  stroke(ready ? color(126, 255, 190, 180) : color(80, 100, 115, 90));
+  strokeWeight(1);
+  rect(bx, by, bw, bh, bh / 2);
+  noStroke();
+  fill(ready ? color(126, 255, 190, 230) : color(100, 120, 135, 150));
+  textAlign(CENTER, CENTER);
+  textSize(s * 0.82);
+  text(ready ? 'CONFIRM & PLACE' : 'SPEND ALL 10 POINTS', bx + bw / 2, by + bh / 2 + 1);
+
+  pop();
+}
+
+function drawPlacementPrompt() {
+  push();
+  noStroke();
+  const s = constrain(width * 0.031, 10, 16);
+  const msg = !window.cameraEnabled
+    ? 'TAP TO START THE CAMERA'
+    : field.ok && fieldLock > 0.05
+    ? 'TAP THE TABLE TO PLACE YOUR OTTO'
+    : 'SHOW THE GREEN MARKER TO PLACE YOUR OTTO';
+  textAlign(CENTER, CENTER);
+  textSize(s * 0.8);
+  const w = textWidth(msg) + 36;
+  const h = s * 2.6;
+  const x = width / 2 - w / 2;
+  const y = height - h - 28;
+  fill(4, 10, 16, 205);
+  rect(x, y, w, h, h / 2);
+  fill(240, 252, 255, 230);
+  text(msg, width / 2, y + h / 2 + 1);
+  pop();
+}
+
+function drawColonyLostScreen() {
+  push();
+  noStroke();
+  fill(4, 10, 16, 225);
+  rect(0, 0, width, height);
+  textAlign(CENTER, CENTER);
+  fill(255, 150, 150, 235);
+  textSize(constrain(width * 0.075, 24, 42));
+  text('COLONY LOST', width / 2, height * 0.4);
+  fill(180, 220, 240, 190);
+  textSize(constrain(width * 0.035, 11, 16));
+  text('All of your Ottos are gone.', width / 2, height * 0.48);
+
+  const bw = Math.min(width - 60, 280);
+  const bh = 54;
+  const bx = width / 2 - bw / 2;
+  const by = height * 0.56;
+  failRetryHit = { x: bx, y: by, w: bw, h: bh };
+  noFill();
+  stroke(255, 200, 110, 160);
+  strokeWeight(1);
+  rect(bx, by, bw, bh, bh / 2);
+  noStroke();
+  fill(255, 220, 150, 230);
+  textSize(15);
+  text('RETRY WITH A NEW OTTO', width / 2, by + bh / 2 + 1);
+  pop();
+}
+
+function drawLobbyOverlays() {
+  if (!shareConnected) {
+    drawConnectionScreen();
+    return;
+  }
+  if (allocationActive) drawAllocationScreen();
+  else if (placementActive) drawPlacementPrompt();
+  else if (colonyLost) drawColonyLostScreen();
+}
+
 function drawWaiting(now) {
   background(5, 8, 12);
 
@@ -1811,7 +2186,19 @@ function colonyColorMap() {
 }
 
 function colonyColorFor(clientId) {
-  if (!clientId) return COLONY_COLORS[0];
+  if (!clientId) return COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0];
+
+  if (window.shareClientId && clientId === window.shareClientId) {
+    return COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0];
+  }
+
+  if (Array.isArray(guests)) {
+    const g = guests.find((entry) => entry && entry.id === clientId);
+    if (g && typeof g.colorIndex === 'number' && COLONY_COLORS[g.colorIndex]) {
+      return COLONY_COLORS[g.colorIndex];
+    }
+  }
+
   return colonyColorMap().get(clientId) || COLONY_COLORS[0];
 }
 
@@ -2032,7 +2419,7 @@ function drawLocalOttos() {
       alpha,
       o.facing,
       o.pop,
-      o.hp / MAX_HP,
+      o.hp / (o.maxHp || MAX_HP),
       color,
       ottoAssetFor(o.id)
     );
@@ -2057,11 +2444,61 @@ function drawRemoteOttos() {
       alpha,
       r.facing,
       0,
-      r.hp / MAX_HP,
+      r.hp / (r.maxHp || MAX_HP),
       r.dev ? r.color : colonyColorFor(r.client),
       ottoAssetFor(r.id)
     );
   }
+}
+
+function drawOttoPreview(cx, groundY, h, color, asset) {
+  const art = asset || ottoAssets[0];
+  if (!art) return;
+  const w = h * (OTTO_CROP.w / OTTO_CROP.h);
+  const ctx = drawingContext;
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.beginPath();
+  ctx.ellipse(cx, groundY, w * 0.4, w * 0.4 * 0.3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  art.layer.clear();
+  art.layer.image(
+    art.gif,
+    0,
+    0,
+    OTTO_CROP.w,
+    OTTO_CROP.h,
+    OTTO_CROP.x,
+    OTTO_CROP.y,
+    OTTO_CROP.w,
+    OTTO_CROP.h
+  );
+
+  const lc = art.layer.drawingContext;
+  const frame = art.gif.gifProperties
+    ? art.gif.gifProperties.displayIndex
+    : 0;
+  const fill = ottoFillFor(art, frame, color);
+
+  lc.save();
+  lc.globalCompositeOperation = 'source-atop';
+  lc.globalAlpha = OTTO_TINT_ALPHA;
+  lc.fillStyle = rgbColor(color);
+  lc.fillRect(0, 0, OTTO_CROP.w, OTTO_CROP.h);
+  lc.restore();
+
+  if (fill) {
+    lc.save();
+    lc.globalCompositeOperation = 'destination-over';
+    lc.globalAlpha = OTTO_FILL_ALPHA;
+    lc.drawImage(fill, 0, 0);
+    lc.restore();
+  }
+
+  ctx.drawImage(art.layer.canvas, cx - w / 2, groundY - h, w, h);
 }
 
 function drawOttoAt(
@@ -2238,7 +2675,7 @@ function drawHud() {
   text('GREEN-MARKER FIELD', 18, 16 + s * 1.55);
 
   // Room state.
-  let roomText = 'PLAYING SOLO';
+  let roomText = 'CONNECTING TO SHARED SPACE...';
   let roomTone = [150, 200, 220];
   if (shareConnected) {
     roomText = `ROOM ${SHARE_ROOM} · ${online} ONLINE`;
@@ -2339,24 +2776,6 @@ function drawHud() {
   textSize(s * 0.58);
   text('FIELD', chipX + chipW / 2, chipY + chipH / 2 + 1);
 
-  // Solo pause toggle. In a shared room the day pauses itself and players tap YES.
-  if (!shareConnected && !panel.open) {
-    const pauseLabel = paused ? 'RESUME' : 'PAUSE';
-    textSize(s * 0.58);
-    const pw = textWidth(pauseLabel) + 22;
-    const px = chipX + chipW + 12;
-    const py = chipY;
-    pauseHit = { x: px, y: py, w: pw, h: chipH };
-
-    noFill();
-    stroke(paused ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
-    strokeWeight(1);
-    rect(px, py, pw, chipH, chipH / 2);
-    noStroke();
-    fill(paused ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
-    text(pauseLabel, px + pw / 2, py + chipH / 2 + 1);
-  }
-
   // Auto-skip the day-end confirmation for this player.
   if (!panel.open) {
     const autoLabel = autoSkipDay ? 'AUTO ON' : 'AUTO OFF';
@@ -2431,32 +2850,6 @@ function drawHud() {
       textAlign(CENTER, CENTER);
       text(spawnLabel, spawnHit.x + sw / 2, dy + chipH / 2 + 1);
     }
-  }
-
-  // Join button, drawn only while the room is not connected.
-  joinHit = null;
-  if (!shareConnected && shareSupported && !panel.open) {
-    let joinLabel = 'JOIN SHARED SPACE';
-    if (shareStatus === 'connecting') joinLabel = 'JOINING SHARED SPACE...';
-    else if (shareStatus === 'error' || shareError) joinLabel = 'RETRY SHARED SPACE';
-
-    textSize(s * 0.72);
-    const bw = textWidth(joinLabel) + 34;
-    const bh = s * 2.2;
-    const bx = width / 2 - bw / 2;
-    const by = height - 52 - bh;
-
-    joinHit = { x: bx, y: by, w: bw, h: bh };
-
-    noFill();
-    stroke(140, 230, 255, 90);
-    strokeWeight(1);
-    rect(bx, by, bw, bh, bh / 2);
-
-    noStroke();
-    fill(150, 235, 255, 205);
-    textAlign(CENTER, CENTER);
-    text(joinLabel, width / 2, by + bh / 2 + 1);
   }
 
   // Hint while searching for the marker.
@@ -2630,6 +3023,74 @@ function castLocalYes() {
 }
 
 function mousePressed() {
+  if (!shareConnected) {
+    if (hitRect(reconnectHit, mouseX, mouseY) && shareStatus !== 'connecting') {
+      shareConnect();
+    }
+    return false;
+  }
+
+  // The pause vote stays available even over the lobby/fail screens.
+  if (paused && hitRect(yesHit, mouseX, mouseY)) {
+    castLocalYes();
+    return false;
+  }
+
+  if (allocationActive) {
+    for (const h of colorHits) {
+      if (hitRect(h, mouseX, mouseY)) {
+        teamColorIndex = h.index;
+        return false;
+      }
+    }
+    for (const h of allocationHits) {
+      if (hitRect(h, mouseX, mouseY)) {
+        adjustAllocation(h.key, h.dir);
+        return false;
+      }
+    }
+    if (
+      allocationConfirmHit &&
+      allocationConfirmHit.enabled &&
+      hitRect(allocationConfirmHit, mouseX, mouseY)
+    ) {
+      pendingStats = statsFromAllocation(allocationPoints);
+      pendingMaxHp = maxHpFromAllocation(allocationPoints);
+      allocationActive = false;
+      placementActive = true;
+    }
+    return false;
+  }
+
+  if (placementActive) {
+    if (field.ok && fieldLock > 0.05) {
+      let fx = (mouseX - field.x) / field.px;
+      let fy = (mouseY - field.y) / (field.px * FIELD_TILT);
+      const limit = fieldLimit(pendingStats.size);
+      const d = Math.hypot(fx, fy);
+      if (d > limit) {
+        fx = (fx / d) * limit;
+        fy = (fy / d) * limit;
+      }
+      const placed = createOtto(pendingStats, fx, fy, pendingMaxHp);
+      placed.spawn = 0;
+      ottos.push(placed);
+      colonySpawned = true;
+      placementActive = false;
+      allocationActive = false;
+      fieldEntered = true;
+      shared.started = true;
+      if (window.me) me.colorIndex = teamColorIndex;
+      syncMe();
+    }
+    return false;
+  }
+
+  if (colonyLost) {
+    if (hitRect(failRetryHit, mouseX, mouseY)) resetAllocation();
+    return false;
+  }
+
   // While examining, dev buttons edit stats; any other click closes the view.
   if (examineClone) {
     if (devMode && !shareConnected) {
@@ -2662,11 +3123,6 @@ function mousePressed() {
     return false;
   }
 
-  if (hitRect(joinHit, mouseX, mouseY)) {
-    if (!shareConnected && shareStatus !== 'connecting') shareConnect();
-    return false;
-  }
-
   if (hitRect(timeHit, mouseX, mouseY)) {
     const current =
       shareConnected && typeof shared.timeScale === 'number'
@@ -2678,30 +3134,9 @@ function mousePressed() {
     return false;
   }
 
-  if (hitRect(devHit, mouseX, mouseY)) {
-    if (!shareConnected) devMode = !devMode;
-    return false;
-  }
-
-  if (hitRect(spawnHit, mouseX, mouseY)) {
-    if (!shareConnected && devMode) spawnDevEnemy();
-    return false;
-  }
-
   if (hitRect(autoHit, mouseX, mouseY)) {
     autoSkipDay = !autoSkipDay;
-    if (autoSkipDay && paused) {
-      if (!shareConnected) {
-        paused = false;
-      } else {
-        castLocalYes();
-      }
-    }
-    return false;
-  }
-
-  if (hitRect(pauseHit, mouseX, mouseY)) {
-    if (!shareConnected) paused = !paused;
+    if (autoSkipDay && paused) castLocalYes();
     return false;
   }
 
