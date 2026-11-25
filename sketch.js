@@ -168,6 +168,7 @@ let allocationHits = [];
 let allocationConfirmHit = null;
 let colorHits = [];
 let teamColorIndex = 0;
+let pendingAssetIndex = 0;
 let pendingStats = null;
 let pendingMaxHp = MAX_HP;
 let placementActive = false;
@@ -193,7 +194,7 @@ async function setup() {
     me: {
       name: 'Otto',
       ottos: [],
-      colorIndex: 0,
+      colorIndex: -1,
     },
   });
 
@@ -251,6 +252,10 @@ function shareReady() {
   // No colony yet: start the local create/place flow. Late joiners also get
   // this flow while the shared day clock keeps running.
   if (!colonySpawned && ottos.length === 0 && !placementActive) {
+    if (!allocationActive) {
+      pendingAssetIndex = randomAssetIndex();
+      teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+    }
     allocationActive = true;
   }
 
@@ -435,6 +440,7 @@ function resetTracking() {
   allocationConfirmHit = null;
   colorHits = [];
   teamColorIndex = 0;
+  pendingAssetIndex = randomAssetIndex();
   pendingStats = null;
   pendingMaxHp = MAX_HP;
   placementActive = false;
@@ -475,13 +481,14 @@ function energyRequirementFor(size) {
   return Math.max(5, Math.round(ENERGY_PER_SIZE * size));
 }
 
-function createOtto(stats, x, y, maxHp = MAX_HP) {
+function createOtto(stats, x, y, maxHp = MAX_HP, assetIndex = null) {
   const st = stats || defaultStats();
   return {
     id: nextOttoId++,
     pos: { x: x || 0, y: y || 0 },
     maxHp,
     hp: maxHp,
+    assetIndex,
     facing: 1,
     moving: false,
     pop: 0,
@@ -594,7 +601,10 @@ function startExamine(target, kind = 'local') {
     targetSize,
     facing: target.facing || 1,
     color,
-    asset: ottoAssetFor(target.id),
+    asset:
+      isLocal && target.assetIndex != null
+        ? ottoAssets[target.assetIndex] || ottoAssetFor(target.id)
+        : ottoAssetFor(target.id),
   };
   examineT = 0;
   examineLeaving = false;
@@ -1624,6 +1634,7 @@ function syncMe() {
       sight: o.stats.sight,
       hp: Math.max(0, Math.round(o.hp)),
       maxHp: Math.max(1, Math.round(o.maxHp || MAX_HP)),
+      assetIndex: o.assetIndex == null ? -1 : o.assetIndex,
     });
   }
   me.ottos = list;
@@ -1665,6 +1676,7 @@ function updateRemote(dt) {
             sight: 8,
             hp: MAX_HP,
             maxHp: MAX_HP,
+            assetIndex: null,
             credited: false,
             deadTime: 0,
             facing: 1,
@@ -1682,6 +1694,10 @@ function updateRemote(dt) {
         r.sight = numberOr(data.sight, 8);
         r.hp = numberOr(data.hp, MAX_HP);
         r.maxHp = numberOr(data.maxHp, MAX_HP);
+        r.assetIndex =
+          typeof data.assetIndex === 'number' && data.assetIndex >= 0
+            ? data.assetIndex
+            : null;
 
         // The loser's phone broadcasts hp 0 for a short death linger. The
         // nearby living Otto on this phone is the victor and claims the food.
@@ -1872,7 +1888,8 @@ function resetAllocation() {
   allocationHits = [];
   allocationConfirmHit = null;
   colorHits = [];
-  teamColorIndex = 0;
+  teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+  pendingAssetIndex = randomAssetIndex();
   pendingStats = null;
   pendingMaxHp = MAX_HP;
   placementActive = false;
@@ -1974,7 +1991,7 @@ function drawAllocationScreen() {
     previewBottom,
     previewH,
     COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0],
-    ottoAssetFor(nextOttoId)
+    ottoAssets[pendingAssetIndex] || ottoAssetFor(nextOttoId)
   );
 
   // Team colour picker.
@@ -2194,7 +2211,12 @@ function colonyColorFor(clientId) {
 
   if (Array.isArray(guests)) {
     const g = guests.find((entry) => entry && entry.id === clientId);
-    if (g && typeof g.colorIndex === 'number' && COLONY_COLORS[g.colorIndex]) {
+    if (
+      g &&
+      typeof g.colorIndex === 'number' &&
+      g.colorIndex >= 0 &&
+      COLONY_COLORS[g.colorIndex]
+    ) {
       return COLONY_COLORS[g.colorIndex];
     }
   }
@@ -2245,6 +2267,11 @@ function ottoAssetIndexFor(id) {
 
 function ottoAssetFor(id) {
   return ottoAssets[ottoAssetIndexFor(id)] || ottoAssets[0];
+}
+
+function randomAssetIndex() {
+  if (!ottoAssets.length) return 0;
+  return Math.floor(Math.random() * ottoAssets.length);
 }
 
 // Build one coloured fill canvas per palette entry for a single GIF frame.
@@ -2421,7 +2448,7 @@ function drawLocalOttos() {
       o.pop,
       o.hp / (o.maxHp || MAX_HP),
       color,
-      ottoAssetFor(o.id)
+      o.assetIndex == null ? ottoAssetFor(o.id) : ottoAssets[o.assetIndex] || ottoAssetFor(o.id)
     );
   }
 }
@@ -2446,7 +2473,7 @@ function drawRemoteOttos() {
       0,
       r.hp / (r.maxHp || MAX_HP),
       r.dev ? r.color : colonyColorFor(r.client),
-      ottoAssetFor(r.id)
+      r.assetIndex == null ? ottoAssetFor(r.id) : ottoAssets[r.assetIndex] || ottoAssetFor(r.id)
     );
   }
 }
@@ -3072,7 +3099,13 @@ function mousePressed() {
         fx = (fx / d) * limit;
         fy = (fy / d) * limit;
       }
-      const placed = createOtto(pendingStats, fx, fy, pendingMaxHp);
+      const placed = createOtto(
+        pendingStats,
+        fx,
+        fy,
+        pendingMaxHp,
+        pendingAssetIndex
+      );
       placed.spawn = 0;
       ottos.push(placed);
       colonySpawned = true;
