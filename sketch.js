@@ -172,10 +172,16 @@ let pendingAssetIndex = 0;
 let pendingStats = null;
 let pendingMaxHp = MAX_HP;
 let placementActive = false;
+let placementMode = 'new'; // 'new' or 'stored'
 let colonySpawned = false;
 let colonyLost = false;
-let reconnectHit = null;
-let failRetryHit = null;
+let storedOtto = null;
+let lobbyChoiceActive = false;
+let storedPlaceHit = null;
+let scratchHit = null;
+let storageHit = null;
+let storeHit = null;
+const STORAGE_KEY = 'otto-stored-v1';
 
 async function setup() {
   createCanvas(windowWidth, windowHeight);
@@ -217,6 +223,7 @@ async function setup() {
   }
 
   resetTracking();
+  loadStoredOtto();
   lastMillis = millis() / 1000;
 
   cam = createPhoneCamera('environment', false, 'cover');
@@ -252,11 +259,17 @@ function shareReady() {
   // No colony yet: start the local create/place flow. Late joiners also get
   // this flow while the shared day clock keeps running.
   if (!colonySpawned && ottos.length === 0 && !placementActive) {
-    if (!allocationActive) {
-      pendingAssetIndex = randomAssetIndex();
-      teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+    if (storedOtto) {
+      allocationActive = false;
+      lobbyChoiceActive = true;
+    } else {
+      if (!allocationActive) {
+        pendingAssetIndex = randomAssetIndex();
+        teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+      }
+      allocationActive = true;
+      lobbyChoiceActive = false;
     }
-    allocationActive = true;
   }
 
   // Adopt the room's current day and clock instead of starting fresh.
@@ -444,8 +457,15 @@ function resetTracking() {
   pendingStats = null;
   pendingMaxHp = MAX_HP;
   placementActive = false;
+  placementMode = 'new';
   colonySpawned = false;
   colonyLost = false;
+  storedOtto = null;
+  lobbyChoiceActive = false;
+  storedPlaceHit = null;
+  scratchHit = null;
+  storageHit = null;
+  storeHit = null;
   reconnectHit = null;
   failRetryHit = null;
 }
@@ -708,6 +728,7 @@ function drawExamineClone() {
 
 function drawStatsCard() {
   devHits = [];
+  storeHit = null;
   if (!examineClone || examineT < 0.15) return;
   const ref = examineRef;
   const snap = examineSnapshot;
@@ -733,10 +754,12 @@ function drawStatsCard() {
   const id = snap.id;
   const need = energyRequirementFor(st.size);
   const editable = devMode && !shareConnected;
+  const canStore =
+    shareConnected && paused && isLocal && refUsable && !ref.dead && !storedOtto;
 
   const s = constrain(width * 0.031, 10, 16);
   const cardW = editable ? s * 18 : s * 15.5;
-  const cardH = editable ? s * 12.5 : s * 11;
+  const cardH = editable ? s * 12.5 : canStore ? s * 14 : s * 11;
   let cardX = examineClone.x - cardW - s * 3;
   let cardY = examineClone.y - cardH * 0.55;
   cardX = constrain(cardX, 12, width - cardW - 12);
@@ -837,6 +860,23 @@ function drawStatsCard() {
     }
   }
 
+  if (canStore) {
+    const bw = cardW - 20;
+    const bh = s * 2.0;
+    const bx = cardX + 10;
+    const by = cardY + cardH - s * 4.6;
+    storeHit = { x: bx, y: by, w: bw, h: bh };
+    noFill();
+    stroke(126, 255, 190, 150);
+    strokeWeight(1);
+    rect(bx, by, bw, bh, bh / 2);
+    noStroke();
+    fill(126, 255, 190, 225);
+    textAlign(CENTER, CENTER);
+    textSize(s * 0.68);
+    text('STORE OTTO', bx + bw / 2, by + bh / 2 + 1);
+  }
+
   fill(140, 190, 215, 150);
   textAlign(CENTER, TOP);
   textSize(s * 0.55);
@@ -915,8 +955,19 @@ function draw() {
   drawHud();
   if (panel.open) drawPanel();
 
-  if (colonySpawned && ottos.length === 0 && !allocationActive && !placementActive) {
-    colonyLost = true;
+  if (
+    colonySpawned &&
+    ottos.length === 0 &&
+    !allocationActive &&
+    !placementActive &&
+    !lobbyChoiceActive
+  ) {
+    if (storedOtto) {
+      lobbyChoiceActive = true;
+      colonyLost = false;
+    } else {
+      colonyLost = true;
+    }
   }
   drawLobbyOverlays();
   if (shareConnected) drawPauseOverlay();
@@ -1161,6 +1212,10 @@ function processColonyDayEnd() {
   for (const parent of parents) reproduce(parent);
 
   for (const o of ottos) o.energy = 0;
+  if (storedOtto) {
+    storedOtto.energy = 0;
+    saveStoredOtto();
+  }
 
   if (ottos.length > before) {
     separateOttos();
@@ -1717,10 +1772,10 @@ function updateRemote(dt) {
     }
   }
 
-  // Sync the shared pause state. Every connected phone must vote YES before a
-  // paused day (and its food spawning) can resume.
+  // Sync the shared pause state. A simple majority starts a 10-second resume
+  // countdown; the day only resumes when that timer expires.
   if (shareConnected && shared.pause && typeof shared.pause === 'object') {
-    const p = shared.pause;
+    let p = shared.pause;
     if (p.active && p.day === dayNumber) {
       if (!paused) {
         paused = true;
@@ -1737,12 +1792,33 @@ function updateRemote(dt) {
         castLocalYes();
       }
 
-      const votes = (shared.pause && shared.pause.votes) || {};
+      p = shared.pause || p;
+      const votes = p.votes || {};
       const have = Object.keys(votes).length;
-      if (have >= needed) {
-        paused = false;
-        localReady = false;
-        shared.pause = { active: false, day: dayNumber, votes: {} };
+      const majority = have > needed / 2;
+
+      if (majority) {
+        if (!p.resumeAt) {
+          shared.pause = {
+            active: true,
+            day: dayNumber,
+            votes: Object.assign({}, votes),
+            resumeAt: Date.now() + 10000,
+          };
+          p = shared.pause;
+        }
+        if (p.resumeAt && Date.now() >= p.resumeAt) {
+          paused = false;
+          localReady = false;
+          shared.pause = { active: false, day: dayNumber, votes: {} };
+        }
+      } else if (p.resumeAt) {
+        // A new participant lowered the majority; cancel the countdown.
+        shared.pause = {
+          active: true,
+          day: dayNumber,
+          votes: Object.assign({}, votes),
+        };
       }
     } else if (!p.active || p.day !== dayNumber) {
       paused = false;
@@ -1842,28 +1918,51 @@ function drawPauseOverlay() {
       ? guests.filter((g) => g && (Array.isArray(g.ottos) || g.otto))
       : [];
     const needed = playerGuests.length + 1;
-    const votes = (shared.pause && shared.pause.votes) || {};
+    const p = shared.pause || {};
+    const votes = p.votes || {};
     const have = Object.keys(votes).length;
+    const majority = have > needed / 2;
+    const resumeAt = p.resumeAt || 0;
+    const remaining = resumeAt ? Math.max(0, resumeAt - Date.now()) : 0;
+    const secs = Math.ceil(remaining / 1000);
 
     fill(180, 220, 240, 190);
     textSize(s * 0.62);
-    text(`Waiting: ${have}/${needed}`, cardX + 10, cardY + 6 + s * 1.15);
+    text(
+      majority ? `RESUMING IN ${secs}s · ${have}/${needed}` : `Waiting: ${have}/${needed}`,
+      cardX + 10,
+      cardY + 6 + s * 1.15
+    );
 
-    const bw = cardW - 20;
-    const bh = s * 2.2;
-    const bx = cardX + 10;
-    const by = cardY + cardH - bh - 6;
-    yesHit = { x: bx, y: by, w: bw, h: bh };
+    if (majority) {
+      yesHit = null;
+      const bw = cardW - 20;
+      const bh = s * 0.75;
+      const bx = cardX + 10;
+      const by = cardY + cardH - bh - 8;
+      const frac = constrain(remaining / 10000, 0, 1);
+      noStroke();
+      fill(255, 255, 255, 34);
+      rect(bx, by, bw, bh, bh / 2);
+      fill(126, 255, 190, 210);
+      rect(bx, by, bw * frac, bh, bh / 2);
+    } else {
+      const bw = cardW - 20;
+      const bh = s * 2.2;
+      const bx = cardX + 10;
+      const by = cardY + cardH - bh - 6;
+      yesHit = { x: bx, y: by, w: bw, h: bh };
 
-    noFill();
-    stroke(localReady ? color(126, 255, 190, 170) : color(140, 230, 255, 90));
-    strokeWeight(1);
-    rect(bx, by, bw, bh, bh / 2);
-    noStroke();
-    fill(localReady ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
-    textAlign(CENTER, CENTER);
-    textSize(s * 0.72);
-    text(localReady ? 'YES ✓' : 'YES', bx + bw / 2, by + bh / 2 + 1);
+      noFill();
+      stroke(localReady ? color(126, 255, 190, 170) : color(140, 230, 255, 90));
+      strokeWeight(1);
+      rect(bx, by, bw, bh, bh / 2);
+      noStroke();
+      fill(localReady ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
+      textAlign(CENTER, CENTER);
+      textSize(s * 0.72);
+      text(localReady ? 'YES ✓' : 'YES', bx + bw / 2, by + bh / 2 + 1);
+    }
   } else {
     fill(180, 220, 240, 190);
     textSize(s * 0.62);
@@ -1890,9 +1989,13 @@ function resetAllocation() {
   colorHits = [];
   teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
   pendingAssetIndex = randomAssetIndex();
+  lobbyChoiceActive = false;
+  storedPlaceHit = null;
+  scratchHit = null;
   pendingStats = null;
   pendingMaxHp = MAX_HP;
   placementActive = false;
+  placementMode = 'new';
   colonySpawned = false;
   colonyLost = false;
   examineClone = null;
@@ -1900,6 +2003,141 @@ function resetAllocation() {
   examineSnapshot = null;
   examineT = 0;
   examineLeaving = false;
+}
+
+function saveStoredOtto() {
+  try {
+    if (!storedOtto) {
+      localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    const o = storedOtto;
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        id: o.id,
+        stats: o.stats,
+        hp: o.hp,
+        maxHp: o.maxHp,
+        energy: o.energy,
+        assetIndex: o.assetIndex,
+        colorIndex: teamColorIndex,
+      })
+    );
+  } catch (e) {
+    // Storage is optional; ignore unavailable/blocked localStorage.
+  }
+}
+
+function loadStoredOtto() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (!s || !s.stats) {
+      localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    const o = createOtto(
+      s.stats,
+      0,
+      0,
+      s.maxHp || MAX_HP,
+      s.assetIndex == null ? null : s.assetIndex
+    );
+    o.id = numberOr(s.id, o.id);
+    o.hp = constrain(numberOr(s.hp, o.maxHp), 1, o.maxHp);
+    o.energy = Math.max(0, numberOr(s.energy, 0));
+    if (typeof s.colorIndex === 'number' && COLONY_COLORS[s.colorIndex]) {
+      teamColorIndex = s.colorIndex;
+    }
+    nextOttoId = Math.max(nextOttoId, o.id + 1);
+    storedOtto = o;
+  } catch (e) {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e2) {}
+  }
+}
+
+function clearStoredOtto() {
+  storedOtto = null;
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (e) {}
+}
+
+function storeOtto(o) {
+  if (!shareConnected || !paused || storedOtto || !o || o.dead) return;
+  const index = ottos.indexOf(o);
+  if (index < 0) return;
+
+  ottos.splice(index, 1);
+  o.pos.x = 0;
+  o.pos.y = 0;
+  o.mode = 'stored';
+  o.moving = false;
+  o.target = null;
+  o.wander = null;
+  o.think = 0;
+  o.fightCd = 0;
+  o.fleeThreat = null;
+  o.fleeUntil = 0;
+  storedOtto = o;
+  saveStoredOtto();
+  dismissExamine();
+  syncMe();
+  if (ottos.length === 0) {
+    lobbyChoiceActive = true;
+    colonyLost = false;
+  }
+}
+
+function placeStoredOtto(fx, fy) {
+  if (!storedOtto) return;
+  const o = storedOtto;
+  const limit = fieldLimit(o.stats.size);
+  const d = Math.hypot(fx, fy);
+  if (d > limit) {
+    fx = (fx / d) * limit;
+    fy = (fy / d) * limit;
+  }
+
+  o.pos.x = fx;
+  o.pos.y = fy;
+  o.mode = 'wander';
+  o.moving = false;
+  o.target = null;
+  o.wander = null;
+  o.think = 0;
+  o.fightCd = 0;
+  o.fleeThreat = null;
+  o.fleeUntil = 0;
+  o.spawn = 0;
+  o.dead = false;
+  o.death = 0;
+  ottos.push(o);
+  fieldEntered = true;
+
+  clearStoredOtto();
+  colonySpawned = true;
+  placementActive = false;
+  placementMode = 'new';
+  lobbyChoiceActive = false;
+  allocationActive = false;
+  colonyLost = false;
+  shared.started = true;
+  if (window.me) me.colorIndex = teamColorIndex;
+  syncMe();
+}
+
+function startFromScratch() {
+  clearStoredOtto();
+  lobbyChoiceActive = false;
+  colonySpawned = false;
+  colonyLost = false;
+  placementActive = false;
+  resetAllocation();
 }
 
 function adjustAllocation(key, dir) {
@@ -2149,12 +2387,73 @@ function drawColonyLostScreen() {
   pop();
 }
 
+function drawStoredChoiceScreen() {
+  if (!storedOtto) return;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 228);
+  rect(0, 0, width, height);
+  textAlign(CENTER, CENTER);
+  fill(240, 252, 255, 235);
+  textSize(constrain(width * 0.075, 24, 42));
+  text(
+    colonySpawned ? 'OTTO IN STORAGE' : 'WELCOME BACK',
+    width / 2,
+    height * 0.28
+  );
+
+  const previewY = height * 0.47;
+  drawOttoPreview(
+    width / 2,
+    previewY,
+    Math.min(120, height * 0.16),
+    COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0],
+    storedOtto.assetIndex == null
+      ? ottoAssetFor(storedOtto.id)
+      : ottoAssets[storedOtto.assetIndex] || ottoAssetFor(storedOtto.id)
+  );
+
+  fill(180, 220, 240, 190);
+  textSize(constrain(width * 0.035, 11, 16));
+  text('You have a stored Otto ready to place.', width / 2, height * 0.56);
+
+  const bw = Math.min(width - 60, 320);
+  const bh = 54;
+  const bx = width / 2 - bw / 2;
+
+  const placeY = height * 0.63;
+  storedPlaceHit = { x: bx, y: placeY, w: bw, h: bh };
+  noFill();
+  stroke(126, 255, 190, 170);
+  strokeWeight(1);
+  rect(bx, placeY, bw, bh, bh / 2);
+  noStroke();
+  fill(126, 255, 190, 230);
+  textSize(15);
+  text('PLACE STORED OTTO', width / 2, placeY + bh / 2 + 1);
+
+  const scratchY = height * 0.72;
+  scratchHit = { x: bx, y: scratchY, w: bw, h: bh };
+  noFill();
+  stroke(255, 200, 110, 150);
+  strokeWeight(1);
+  rect(bx, scratchY, bw, bh, bh / 2);
+  noStroke();
+  fill(255, 220, 150, 230);
+  text('START FROM SCRATCH', width / 2, scratchY + bh / 2 + 1);
+  pop();
+}
+
 function drawLobbyOverlays() {
+  storedPlaceHit = null;
+  scratchHit = null;
   if (!shareConnected) {
     drawConnectionScreen();
     return;
   }
-  if (allocationActive) drawAllocationScreen();
+  if (lobbyChoiceActive && storedOtto) drawStoredChoiceScreen();
+  else if (allocationActive) drawAllocationScreen();
   else if (placementActive) drawPlacementPrompt();
   else if (colonyLost) drawColonyLostScreen();
 }
@@ -2772,6 +3071,7 @@ function drawHud() {
   timeHit = null;
   devHit = null;
   spawnHit = null;
+  storageHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 5.9;
   const label = found ? 'LOCKED' : 'SEEKING';
@@ -2877,6 +3177,24 @@ function drawHud() {
       textAlign(CENTER, CENTER);
       text(spawnLabel, spawnHit.x + sw / 2, dy + chipH / 2 + 1);
     }
+  }
+
+  // Stored Otto indicator. Placement is allowed while paused.
+  if (storedOtto && !panel.open) {
+    const dy = chipY + chipH + 8;
+    const storageLabel = paused ? 'PLACE STORED' : 'STORED · PAUSE';
+    textSize(s * 0.58);
+    const sw = textWidth(storageLabel) + 22;
+    storageHit = { x: 18, y: dy, w: sw, h: chipH };
+
+    noFill();
+    stroke(paused ? color(126, 255, 190, 170) : color(255, 200, 110, 120));
+    strokeWeight(1);
+    rect(18, dy, sw, chipH, chipH / 2);
+    noStroke();
+    fill(paused ? color(126, 255, 190, 230) : color(255, 220, 150, 200));
+    textAlign(CENTER, CENTER);
+    text(storageLabel, 18 + sw / 2, dy + chipH / 2 + 1);
   }
 
   // Hint while searching for the marker.
@@ -3046,7 +3364,9 @@ function castLocalYes() {
   const p = shared.pause || { active: true, day: dayNumber, votes: {} };
   const votes = Object.assign({}, p.votes || {});
   if (shareClientId) votes[shareClientId] = true;
-  shared.pause = { active: true, day: dayNumber, votes };
+  const next = { active: true, day: dayNumber, votes };
+  if (p.resumeAt) next.resumeAt = p.resumeAt;
+  shared.pause = next;
 }
 
 function mousePressed() {
@@ -3060,6 +3380,18 @@ function mousePressed() {
   // The pause vote stays available even over the lobby/fail screens.
   if (paused && hitRect(yesHit, mouseX, mouseY)) {
     castLocalYes();
+    return false;
+  }
+
+  if (lobbyChoiceActive && storedOtto) {
+    if (hitRect(storedPlaceHit, mouseX, mouseY)) {
+      lobbyChoiceActive = false;
+      allocationActive = false;
+      placementActive = true;
+      placementMode = 'stored';
+    } else if (hitRect(scratchHit, mouseX, mouseY)) {
+      startFromScratch();
+    }
     return false;
   }
 
@@ -3085,6 +3417,7 @@ function mousePressed() {
       pendingMaxHp = maxHpFromAllocation(allocationPoints);
       allocationActive = false;
       placementActive = true;
+      placementMode = 'new';
     }
     return false;
   }
@@ -3093,28 +3426,34 @@ function mousePressed() {
     if (field.ok && fieldLock > 0.05) {
       let fx = (mouseX - field.x) / field.px;
       let fy = (mouseY - field.y) / (field.px * FIELD_TILT);
-      const limit = fieldLimit(pendingStats.size);
-      const d = Math.hypot(fx, fy);
-      if (d > limit) {
-        fx = (fx / d) * limit;
-        fy = (fy / d) * limit;
+
+      if (placementMode === 'stored') {
+        placeStoredOtto(fx, fy);
+      } else {
+        const limit = fieldLimit(pendingStats.size);
+        const d = Math.hypot(fx, fy);
+        if (d > limit) {
+          fx = (fx / d) * limit;
+          fy = (fy / d) * limit;
+        }
+        const placed = createOtto(
+          pendingStats,
+          fx,
+          fy,
+          pendingMaxHp,
+          pendingAssetIndex
+        );
+        placed.spawn = 0;
+        ottos.push(placed);
+        colonySpawned = true;
+        placementActive = false;
+        placementMode = 'new';
+        allocationActive = false;
+        fieldEntered = true;
+        shared.started = true;
+        if (window.me) me.colorIndex = teamColorIndex;
+        syncMe();
       }
-      const placed = createOtto(
-        pendingStats,
-        fx,
-        fy,
-        pendingMaxHp,
-        pendingAssetIndex
-      );
-      placed.spawn = 0;
-      ottos.push(placed);
-      colonySpawned = true;
-      placementActive = false;
-      allocationActive = false;
-      fieldEntered = true;
-      shared.started = true;
-      if (window.me) me.colorIndex = teamColorIndex;
-      syncMe();
     }
     return false;
   }
@@ -3124,8 +3463,22 @@ function mousePressed() {
     return false;
   }
 
-  // While examining, dev buttons edit stats; any other click closes the view.
+  if (storedOtto && hitRect(storageHit, mouseX, mouseY)) {
+    if (paused) {
+      lobbyChoiceActive = false;
+      allocationActive = false;
+      placementActive = true;
+      placementMode = 'stored';
+    }
+    return false;
+  }
+
+  // While examining, the store button benches the Otto; any other click closes.
   if (examineClone) {
+    if (storeHit && hitRect(storeHit, mouseX, mouseY)) {
+      if (examineKind === 'local') storeOtto(examineRef);
+      return false;
+    }
     if (devMode && !shareConnected) {
       for (const h of devHits) {
         if (hitRect(h, mouseX, mouseY)) {
