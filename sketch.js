@@ -83,13 +83,6 @@ const STAT_DEFS = {
 const STAT_KEYS = Object.keys(STAT_DEFS);
 const STAT_ROWS = STAT_KEYS.map((key) => ({ key, ...STAT_DEFS[key] }));
 
-const MODE_LABEL = {
-  wander: 'WANDERING',
-  eat: 'SEEKING FOOD',
-  flee: 'FLEEING',
-  hunt: 'HUNTING',
-};
-
 let cam;
 let scan;
 let mask;
@@ -123,6 +116,7 @@ let lastMillis = 0;
 let scanTick = 0;
 let joinHit = null;
 let tuneHit = null;
+let fullscreenHit = null;
 let pauseHit = null;
 let yesHit = null;
 let autoHit = null;
@@ -241,6 +235,8 @@ async function setup() {
   cam = createPhoneCamera('environment', false, 'cover');
   enableCameraTap('TAP TO ENTER OTTO BOX');
   showDesktopQr({ label: 'Scan to open on your phone' });
+  document.addEventListener('fullscreenchange', fullscreenChanged);
+  document.addEventListener('webkitfullscreenchange', fullscreenChanged);
 
   // Solo mode is gone; join the shared room automatically.
   if (typeof shareConnect === 'function' && !shareConnected && shareStatus !== 'connecting') {
@@ -928,6 +924,7 @@ function draw() {
   if (!live) {
     drawWaiting(now);
     drawLobbyOverlays();
+    drawFullscreenButton();
     return;
   }
 
@@ -996,6 +993,7 @@ function draw() {
   }
   drawLobbyOverlays();
   if (shareConnected) drawPauseOverlay();
+  drawFullscreenButton();
 }
 
 // ---------------------------------------------------------------- detection
@@ -2283,6 +2281,13 @@ function numberOr(v, fallback) {
 // ------------------------------------------------------------------ drawing
 
 function drawPauseOverlay() {
+  // The creation screen already has a full layout; its stats column must not
+  // be covered by the pause card.
+  if (allocationActive) {
+    yesHit = null;
+    return;
+  }
+
   if (!paused) {
     yesHit = null;
     return;
@@ -3488,9 +3493,6 @@ function drawFieldDebug() {
 function drawHud() {
   const s = constrain(width * 0.031, 10, 16);
   const found = marker.found;
-  const lead = ottos[0];
-  const st = lead ? lead.stats : defaultStats();
-  const need = energyRequirementFor(st.size);
   const online = shareConnected
     ? (Array.isArray(guests) ? guests.length : 0) + 1
     : 0;
@@ -3542,26 +3544,12 @@ function drawHud() {
   textSize(s * 0.55);
   text('YOU', swX + s * 0.55, 16 + s * 2.95 + 1);
 
-  fill(255, 214, 140, 170);
-  textSize(s * 0.6);
-  text(
-    lead
-      ? `ENERGY ${Math.round(lead.energy)}/${need * ENERGY_STORE_MULT} · ${
-          MODE_LABEL[lead.mode] || ''
-        } · OTTOS ${ottos.length} · DAY ${dayNumber}`
-      : fieldEntered
-      ? 'COLONY LOST · RELOAD TO BEGIN AGAIN'
-      : 'NO OTTO YET · SHOW IT THE GREEN TAPE SQUARE',
-    18,
-    16 + s * 4.05
-  );
-
   // Day progress timer.
   const dayProgress = paused ? 1 : constrain(dayClock / DAY_SECONDS, 0, 1);
   const barW = Math.min(width * 0.42, s * 18);
   const barH = s * 0.42;
   const barX = 18;
-  const barY = 16 + s * 5.1;
+  const barY = 16 + s * 3.95;
   noStroke();
   fill(255, 255, 255, 34);
   rect(barX, barY, barW, barH, barH / 2);
@@ -3576,7 +3564,7 @@ function drawHud() {
     barY + barH / 2 + 1
   );
 
-  // Tracking and tuning, kept clear of the desktop QR in the top-right corner.
+  // HUD controls, kept clear of the desktop QR in the top-right corner.
   pauseHit = null;
   autoHit = null;
   timeHit = null;
@@ -3584,23 +3572,11 @@ function drawHud() {
   spawnHit = null;
   storageHit = null;
   const rowH = s * 1.9;
-  const rowY = 16 + s * 5.9;
-  const label = found ? 'LOCKED' : 'SEEKING';
-  const tone = found ? [126, 255, 190] : [255, 200, 110];
-
-  noStroke();
-  fill(tone[0], tone[1], tone[2], 230);
-  circle(22, rowY + rowH / 2, s * 0.5);
-
-  textAlign(LEFT, CENTER);
-  textSize(s * 0.68);
-  const labelW = textWidth(label);
-  fill(tone[0], tone[1], tone[2], 220);
-  text(label, 34, rowY + rowH / 2 + 1);
+  const rowY = 16 + s * 4.85;
 
   const chipW = s * 4.4;
   const chipH = rowH;
-  const chipX = 34 + labelW + 16;
+  const chipX = 18;
   const chipY = rowY;
   tuneHit = { x: chipX, y: chipY, w: chipW, h: chipH };
 
@@ -3881,6 +3857,11 @@ function castLocalYes() {
 }
 
 function mousePressed() {
+  if (hitRect(fullscreenHit, mouseX, mouseY)) {
+    togglePageFullscreen();
+    return false;
+  }
+
   if (!shareConnected) {
     if (hitRect(reconnectHit, mouseX, mouseY) && shareStatus !== 'connecting') {
       shareConnect();
@@ -4091,6 +4072,7 @@ function fitCanvasToViewport() {
 function resetUiHits() {
   joinHit = null;
   tuneHit = null;
+  fullscreenHit = null;
   pauseHit = null;
   yesHit = null;
   autoHit = null;
@@ -4100,6 +4082,121 @@ function resetUiHits() {
 function windowResized() {
   fitCanvasToViewport();
   resetUiHits();
+}
+
+function fullscreenRequest() {
+  const root = document.documentElement;
+  return (
+    root.requestFullscreen ||
+    root.webkitRequestFullscreen ||
+    root.mozRequestFullScreen ||
+    root.msRequestFullscreen
+  );
+}
+
+function isPageFullscreen() {
+  return !!(
+    document.fullscreenElement ||
+    document.webkitFullscreenElement ||
+    document.mozFullScreenElement ||
+    document.msFullscreenElement
+  );
+}
+
+function fullscreenAvailable() {
+  const enabled =
+    document.fullscreenEnabled !== undefined
+      ? document.fullscreenEnabled
+      : document.webkitFullscreenEnabled;
+  return !!fullscreenRequest() && enabled !== false;
+}
+
+function fullscreenChanged() {
+  resetUiHits();
+  fitCanvasToViewport();
+}
+
+function togglePageFullscreen() {
+  const exit =
+    document.exitFullscreen ||
+    document.webkitExitFullscreen ||
+    document.mozCancelFullScreen ||
+    document.msExitFullscreen;
+
+  if (isPageFullscreen()) {
+    if (!exit) return;
+    try {
+      const result = exit.call(document);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (e) {}
+    return;
+  }
+
+  const request = fullscreenRequest();
+  if (!request) return;
+  try {
+    const result = request.call(document.documentElement, {
+      navigationUI: 'hide',
+    });
+    if (result && typeof result.catch === 'function') result.catch(() => {});
+  } catch (e) {}
+}
+
+function drawFullscreenButton() {
+  fullscreenHit = null;
+  if (
+    lobbyChoiceActive ||
+    placementActive ||
+    panel.open ||
+    !fullscreenAvailable()
+  ) {
+    return;
+  }
+
+  const s = constrain(width * 0.031, 10, 16);
+  const size = Math.max(44, s * 2.6);
+  const x = width - size - 16;
+  const y = height - size - 16;
+
+  // During creation, only show the button when it fits below the panel.
+  if (allocationActive) {
+    const panelBottom = (height + Math.min(height - 20, 600)) / 2;
+    if (height - panelBottom < size + 24) return;
+  }
+  fullscreenHit = { x, y, w: size, h: size };
+  const cx = x + size / 2;
+  const cy = y + size / 2;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 190);
+  circle(cx, cy, size);
+  noFill();
+  stroke(140, 230, 255, 85);
+  strokeWeight(1);
+  circle(cx, cy, size);
+
+  const inset = size * 0.3;
+  const arm = size * 0.16;
+  stroke(180, 240, 255, 235);
+  strokeWeight(1.7);
+  const corner = (px, py, sx, sy) => {
+    line(px, py, px + sx * arm, py);
+    line(px, py, px, py + sy * arm);
+  };
+
+  if (!isPageFullscreen()) {
+    corner(x + inset, y + inset, 1, 1);
+    corner(x + size - inset, y + inset, -1, 1);
+    corner(x + size - inset, y + size - inset, -1, -1);
+    corner(x + inset, y + size - inset, 1, -1);
+  } else {
+    corner(x + inset + arm, y + inset + arm, -1, -1);
+    corner(x + size - inset - arm, y + inset + arm, 1, -1);
+    corner(x + size - inset - arm, y + size - inset - arm, 1, 1);
+    corner(x + inset + arm, y + size - inset - arm, -1, 1);
+  }
+  pop();
 }
 
 // Phones keep browser chrome (address bar, tab strip) unless the page is opened
@@ -4148,9 +4245,4 @@ function enableMobileFullscreen() {
   const opts = { once: true, passive: true, capture: true };
   window.addEventListener('pointerup', enter, opts);
   window.addEventListener('touchend', enter, opts);
-
-  document.addEventListener('fullscreenchange', () => {
-    resetUiHits();
-    fitCanvasToViewport();
-  });
 }
