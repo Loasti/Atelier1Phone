@@ -596,6 +596,7 @@ function createOtto(stats, x, y, maxHp = MAX_HP, assetIndex = null) {
     wander: null,
     think: 0,
     fightCd: 0,
+    hurtUntil: 0,
     fleeUntil: 0,
     fleeThreat: null,
     threatX: null,
@@ -1556,6 +1557,7 @@ function enterField() {
     first.wander = null;
     first.think = 0;
     first.fightCd = 0;
+    first.hurtUntil = 0;
   }
 }
 
@@ -1588,6 +1590,7 @@ function updateBehaviour(dt, sync = true) {
 
     // Keep the Otto inside the taped square.
     clampOttoToField(o);
+    receiveIncomingAttack(o);
   }
 
   // Keep only this phone's own Ottos from overlapping. Remote colonies are a
@@ -1760,6 +1763,7 @@ function chooseIntent(o) {
       o.target = {
         x: o.threatX == null ? o.pos.x : o.threatX,
         y: o.threatY == null ? o.pos.y : o.threatY,
+        foe: threatAlive ? o.fleeThreat : null,
       };
       return;
     }
@@ -1813,7 +1817,7 @@ function chooseIntent(o) {
     o.threatX = enemy.x;
     o.threatY = enemy.y;
     o.threatAt = simClock;
-    o.target = { x: enemy.x, y: enemy.y };
+    o.target = { x: enemy.x, y: enemy.y, foe: enemy };
     return;
   }
 
@@ -2015,6 +2019,53 @@ function keepBesideFoe(o) {
   o.pos.y += (dy / d) * push;
 }
 
+function markOttoDead(o) {
+  o.hp = 0;
+  o.dead = true;
+  o.death = 0;
+  o.mode = 'dead';
+  o.moving = false;
+  o.target = null;
+}
+
+// Real remote Ottos are authoritative for their own HP. Each phone applies
+// incoming damage to its own Ottos from a nearby attacker that is targeting
+// them. Both hunters and fleeing Ottos can attack their current target. The
+// victim's hurtUntil is a real-time encounter cooldown shared by all attackers,
+// so a 5x day cannot turn it into per-frame damage.
+function receiveIncomingAttack(o) {
+  if (
+    o.dead ||
+    Date.now() < o.hurtUntil ||
+    !shareConnected ||
+    !window.shareClientId
+  ) {
+    return;
+  }
+
+  const myId = window.shareClientId + '#' + o.id;
+  let attacker = null;
+  let best = Infinity;
+
+  for (const r of remote.values()) {
+    if (r.dev || r.hp <= 0 || r.targetId !== myId) continue;
+    if (r.mode !== 'hunt' && r.mode !== 'flee') continue;
+    const reach = fightStandoff(o.stats.size, r.size) + 0.05;
+    const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
+    if (d <= reach && d < best) {
+      best = d;
+      attacker = r;
+    }
+  }
+
+  if (!attacker) return;
+
+  o.hurtUntil = Date.now() + FIGHT_COOLDOWN * 1000;
+  o.hp = Math.max(0, o.hp - Math.max(1, attacker.attack));
+  o.pop = 1;
+  if (o.hp <= 0) markOttoDead(o);
+}
+
 function fightIfTouching(o) {
   if (o.dead || o.fightCd > 0) return;
   const foe = o.target && o.target.foe;
@@ -2026,13 +2077,13 @@ function fightIfTouching(o) {
 
   o.fightCd = FIGHT_COOLDOWN;
 
-  // Direct damage: the attacker's Attack stat is subtracted from HP.
-  o.hp = Math.max(0, o.hp - Math.max(1, foe.attack));
-
-  // Dev enemies have no phone to apply damage to them, so take it here.
+  // Dev enemies have no phone to apply damage to them, nor an incoming-damage
+  // simulation, so resolve both sides here.
   if (foe.dev) {
+    o.hp = Math.max(0, o.hp - Math.max(1, foe.attack));
     foe.hp = Math.max(0, foe.hp - Math.max(1, o.stats.attack));
     if (foe.hp <= 0) foe.deadTime = 0;
+    if (o.hp <= 0) markOttoDead(o);
   }
 
   // Resolve to the standoff edge plus a small knockback. Both phones run the
@@ -2053,15 +2104,6 @@ function fightIfTouching(o) {
   o.wander = null;
   o.chaseStartDist = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
   o.chaseElapsed = 0;
-
-  if (o.hp <= 0) {
-    o.hp = 0;
-    o.dead = true;
-    o.death = 0;
-    o.mode = 'dead';
-    o.moving = false;
-    o.target = null;
-  }
 }
 
 function healOtto(o, fraction = HEAL_FRACTION) {
@@ -2148,6 +2190,9 @@ function syncMe() {
       hp: Math.max(0, Math.round(o.hp)),
       maxHp: Math.max(1, Math.round(o.maxHp || MAX_HP)),
       assetIndex: o.assetIndex == null ? -1 : o.assetIndex,
+      mode: o.mode,
+      targetId:
+        o.target && o.target.foe ? o.target.foe.id : null,
     });
   }
   me.ottos = list;
@@ -2193,6 +2238,8 @@ function updateRemote(dt) {
             hp: MAX_HP,
             maxHp: MAX_HP,
             assetIndex: null,
+            mode: 'wander',
+            targetId: null,
             credited: false,
             deadTime: 0,
             facing: 1,
@@ -2214,6 +2261,9 @@ function updateRemote(dt) {
           typeof data.assetIndex === 'number' && data.assetIndex >= 0
             ? data.assetIndex
             : null;
+        r.mode = typeof data.mode === 'string' ? data.mode : 'wander';
+        r.targetId =
+          typeof data.targetId === 'string' ? data.targetId : null;
 
         // The loser's phone broadcasts hp 0 for a short death linger. The
         // nearby living Otto on this phone is the victor and claims the food.
@@ -2600,6 +2650,7 @@ function placeStoredOtto(fx, fy) {
   o.wander = null;
   o.think = 0;
   o.fightCd = 0;
+  o.hurtUntil = 0;
   o.fleeThreat = null;
   o.fleeUntil = 0;
   o.chaseIgnoreId = null;
