@@ -2909,10 +2909,26 @@ function allocationAtMax(key) {
   );
 }
 
+function allocationReductionPoints() {
+  let total = 0;
+  for (const key of Object.keys(allocationPoints)) {
+    total += Math.max(0, -allocationPoints[key]);
+  }
+  return total;
+}
+
+function canReduceAllocation(key) {
+  return (
+    allocationPoints[key] > -5 &&
+    allocationReductionPoints() < 10
+  );
+}
+
 function adjustAllocation(key, dir) {
   if (dir < 0) {
-    // Up to five steps below the base stat, each worth one extra point.
-    if (allocationPoints[key] <= -5) return;
+    // Each stat can go five steps below base, but reductions can only grant
+    // ten extra points in total.
+    if (!canReduceAllocation(key)) return;
     allocationPoints[key] -= 1;
     allocationRemaining += 1;
   } else {
@@ -3140,7 +3156,7 @@ function drawAllocationScreen() {
     ]) {
       const active =
         dir < 0
-          ? points > -5
+          ? canReduceAllocation(key)
           : allocationRemaining > 0 && !allocationAtMax(key);
       noFill();
       stroke(active ? color(140, 230, 255, 120) : color(80, 100, 115, 80));
