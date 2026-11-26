@@ -40,6 +40,7 @@ const FOOD_AMOUNT = 10;
 const FOOD_MAX = 30;
 const FOOD_PER_DAY = 30;
 const FOOD_RADIUS = 0.45;
+const HEAL_FRACTION = 0.25; // fraction of max HP restored by eating
 
 const DAY_SECONDS = 60; // one day: food is tallied and reproduction is checked
 
@@ -483,7 +484,7 @@ function resetTracking() {
 function defaultStats() {
   return {
     attack: 10,
-    speed: 2.5,
+    speed: 1,
     size: 1,
     sight: 8,
     aggression: 9,
@@ -603,7 +604,7 @@ function startExamine(target, kind = 'local') {
       maxHp: target.maxHp || MAX_HP,
       stats: {
         attack: target.attack,
-        speed: target.speed || 2.5,
+        speed: target.speed || 1,
         size: target.size,
         sight: target.sight,
         aggression: target.aggression,
@@ -758,7 +759,7 @@ function drawStatsCard() {
       ? ref.stats
       : {
           attack: ref.attack,
-          speed: ref.speed == null ? 2.5 : ref.speed,
+          speed: ref.speed == null ? 1 : ref.speed,
           size: ref.size,
           sight: ref.sight,
           aggression: ref.aggression,
@@ -1731,6 +1732,7 @@ function chooseIntent(o) {
   // Aggression against the other Otto's Size decides fight or flight.
   const scared = enemy && st.aggression < enemy.size * 10;
   const hungry = o.energy < need;
+  const needsHeal = o.hp < (o.maxHp || MAX_HP);
   const wantsSurplus = o.energy < need * ENERGY_STORE_MULT;
 
   if (scared) {
@@ -1744,7 +1746,7 @@ function chooseIntent(o) {
     return;
   }
 
-  if (food && hungry) {
+  if (food && (hungry || needsHeal)) {
     o.mode = 'eat';
     o.target = { x: food.x, y: food.y };
     return;
@@ -1850,7 +1852,7 @@ function updateChase(o, dt) {
   if (o.chaseElapsed < 1.0) return;
 
   const d = Math.hypot(foe.x - o.pos.x, foe.y - o.pos.y);
-  const foeSpeed = numberOr(foe.speed, 2.5);
+  const foeSpeed = numberOr(foe.speed, 1);
   const faster = foeSpeed > o.stats.speed * 1.05;
   const grown = d - o.chaseStartDist;
 
@@ -1991,16 +1993,27 @@ function fightIfTouching(o) {
   }
 }
 
+function healOtto(o, fraction = HEAL_FRACTION) {
+  const maxHp = o.maxHp || MAX_HP;
+  o.hp = Math.min(maxHp, o.hp + maxHp * fraction);
+}
+
 function eatNearby(o, store) {
-  const max = energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT;
-  if (o.energy >= max) return;
+  const maxEnergy = energyRequirementFor(o.stats.size) * ENERGY_STORE_MULT;
+  const maxHp = o.maxHp || MAX_HP;
+  // A full Otto still eats if it is damaged and the food can heal it.
+  if (o.energy >= maxEnergy && o.hp >= maxHp) return;
 
   for (const id in store) {
     const f = store[id];
     if (!f || typeof f.x !== 'number') continue;
     if (Math.hypot(f.x - o.pos.x, f.y - o.pos.y) > EAT_RADIUS) continue;
 
-    o.energy = Math.min(max, o.energy + (Number(f.amount) || FOOD_AMOUNT));
+    o.energy = Math.min(
+      maxEnergy,
+      o.energy + (Number(f.amount) || FOOD_AMOUNT)
+    );
+    healOtto(o);
     delete store[id];
     o.pop = 1;
     return;
@@ -2099,7 +2112,7 @@ function updateRemote(dt) {
             ty: data.y,
             size: 1,
             attack: 10,
-            speed: 2.5,
+            speed: 1,
             aggression: 10,
             sight: 8,
             hp: MAX_HP,
@@ -2117,7 +2130,7 @@ function updateRemote(dt) {
         r.ty = data.y;
         r.size = numberOr(data.size, 1);
         r.attack = numberOr(data.attack, 10);
-        r.speed = numberOr(data.speed, 2.5);
+        r.speed = numberOr(data.speed, 1);
         r.aggression = numberOr(data.aggression, 10);
         r.sight = numberOr(data.sight, 8);
         r.hp = numberOr(data.hp, MAX_HP);
@@ -2252,6 +2265,7 @@ function awardKill(foe) {
 
   if (!victor) return;
   victor.energy += Math.max(0, numberOr(foe.size, 1)) * 100;
+  healOtto(victor);
   victor.pop = 1;
 }
 
