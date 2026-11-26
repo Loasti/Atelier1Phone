@@ -19,10 +19,12 @@ const OTTO_CROP = { x: 109, y: 135, w: 135, h: 149 };
 // The whole play area is the green tape square. Its four detected corners map
 // the unit square onto the floor in perspective, so every phone shares the
 // same taped boundary. Sight, speed and food distances use these field units.
-// 36 units across keeps roughly the old food/space density. Raise it for a
-// larger virtual world (smaller-looking Ottos), lower it for a cozier one.
-const FIELD_UNITS_ACROSS = 36;
-const FIELD_HALF = FIELD_UNITS_ACROSS / 2;
+// The default is 36; dev mode can widen the virtual world up to 120 units.
+const FIELD_DEFAULT_UNITS = 36;
+const FIELD_MIN_UNITS = 18;
+const FIELD_MAX_UNITS = 120;
+let FIELD_UNITS_ACROSS = FIELD_DEFAULT_UNITS;
+let FIELD_HALF = FIELD_UNITS_ACROSS / 2;
 const OTTO_UNITS_TALL = 3.2;
 const OTTO_SPACING = 1.5; // minimum centre distance per unit of combined Size
 const OTTO_COLLISION_SPACING = 0.9; // gentler per-frame spacing so food can be shared
@@ -37,7 +39,11 @@ const FRIEND_STEER = 0.9; // how strongly friends bend the path
 
 // Food and time.
 const FOOD_AMOUNT = 25;
-const FOOD_PER_COLONY = 15; // fresh pieces per living colony each day
+const FOOD_PER_COLONY_DEFAULT = 15;
+const FOOD_PER_COLONY_MIN = 0;
+const FOOD_PER_COLONY_MAX = 100;
+const FOOD_PER_COLONY_STEP = 5;
+let FOOD_PER_COLONY = FOOD_PER_COLONY_DEFAULT;
 const FOOD_RADIUS = 0.45;
 const HEAL_FRACTION = 0.25; // fraction of max HP restored by eating
 
@@ -56,19 +62,27 @@ const FIGHT_COOLDOWN = 1.1;
 const MAX_HP = 100;
 const DEATH_LINGER = 0.8; // dead Ottos stay visible briefly so peers see hp reach 0
 
-// Colony colours. Every phone sees the same assignment because the palette is
-// handed out in sorted client-ID order, not by who connected first.
+// Colony colours. Players choose a swatch; the sorted map is only a fallback
+// for older clients that did not broadcast a colour.
+// Fifteen palette entries, kept as far apart as bright colours can be. The
+// first ten are the original set (yellow and amber were nudged apart); the
+// last five are the additional choices.
 const COLONY_COLORS = [
   [63, 208, 255], // cyan
   [255, 150, 70], // orange
   [255, 92, 180], // magenta
-  [255, 224, 90], // yellow
+  [250, 255, 140], // lemon
   [170, 130, 255], // violet
   [255, 90, 90], // red
   [80, 235, 170], // mint
-  [120, 170, 255], // blue
+  [80, 120, 255], // blue
   [166, 255, 92], // lime
-  [255, 190, 60], // amber
+  [255, 205, 120], // peach
+  [60, 190, 80], // green
+  [205, 70, 250], // purple
+  [180, 120, 60], // brown
+  [50, 190, 180], // teal
+  [255, 160, 190], // rose
 ];
 const OTTO_TINT_ALPHA = 0.2; // ink shifts slightly towards the colony colour
 const OTTO_FILL_ALPHA = 0.42; // soft fill inside the line art
@@ -119,8 +133,17 @@ let fullscreenHit = null;
 let yesHit = null;
 let autoHit = null;
 let autoSkipDay = false;
-let timeHit = null;
-let timeScale = 1; // 1× or 5× for testing
+let speedHits = [];
+let timeScale = 1; // 1×, 5× or 10× for testing
+let foodMinusHit = null;
+let foodPlusHit = null;
+let fieldSliderHit = null;
+let fieldSliderDrag = false;
+let fieldReseedPending = false;
+let pauseAllHit = null;
+let resetLobbyHit = null;
+let resetLobbyArmedUntil = 0;
+let lastLobbyResetId = 0;
 let panel = { open: false, rows: [], drag: null };
 
 // Pause state. Solo toggles locally; multiplayer waits for every connected
@@ -140,11 +163,17 @@ let examineLeaving = false;
 let examineKind = 'local'; // 'local' or 'dev'
 
 // Dev mode: spawn fake enemy Ottos in solo space and edit their stats.
+const DEV_PIN = '0210';
 let devMode = false;
 let devHit = null;
 let spawnHit = null;
 let devHits = [];
 let nextDevId = 1;
+let devPinOpen = false;
+let devPinEntry = '';
+let devPinErrorUntil = 0;
+let devPinHits = [];
+let devPinCloseHit = null;
 
 // Lobby: allocation and placement.
 let allocationActive = false;
@@ -210,7 +239,13 @@ async function setup() {
     host: SHARE_HOST,
     room: SHARE_ROOM,
     app: SHARE_APP,
-    shared: { food: {}, timeScale: 1 },
+    shared: {
+      food: {},
+      timeScale: 1,
+      fieldUnits: FIELD_UNITS_ACROSS,
+      foodPerColony: FOOD_PER_COLONY,
+      lobbyResetId: 0,
+    },
     me: {
       name: 'Otto',
       ottos: [],
@@ -272,12 +307,33 @@ function shareReady() {
     shared.pause = { active: false, day: 0, votes: {} };
   }
   remote.clear();
-  devMode = false;
   if (typeof shared.day !== 'number') shared.day = 1;
   if (typeof shared.dayElapsed !== 'number') shared.dayElapsed = 0;
   if (typeof shared.foodSeedDay !== 'number') shared.foodSeedDay = 0;
   if (typeof shared.timeScale !== 'number') shared.timeScale = 1;
   if (typeof shared.started !== 'boolean') shared.started = false;
+
+  // Dev-mode room settings are shared so one phone changes them for everyone.
+  if (typeof shared.fieldUnits !== 'number') {
+    shared.fieldUnits = FIELD_UNITS_ACROSS;
+  }
+  if (typeof shared.foodPerColony !== 'number') {
+    shared.foodPerColony = FOOD_PER_COLONY;
+  }
+  shared.fieldUnits = Math.round(
+    constrain(shared.fieldUnits, FIELD_MIN_UNITS, FIELD_MAX_UNITS)
+  );
+  shared.foodPerColony = Math.round(
+    constrain(
+      shared.foodPerColony,
+      FOOD_PER_COLONY_MIN,
+      FOOD_PER_COLONY_MAX
+    )
+  );
+  if (typeof shared.lobbyResetId !== 'number') shared.lobbyResetId = 0;
+  lastLobbyResetId = shared.lobbyResetId;
+  applyFieldUnits(shared.fieldUnits, { broadcast: false });
+  FOOD_PER_COLONY = shared.foodPerColony;
 
   // No colony yet: start the local create/place flow. Late joiners also get
   // this flow while the shared day clock keeps running.
@@ -289,7 +345,7 @@ function shareReady() {
     } else {
       if (!allocationActive) {
         pendingAssetIndex = randomAssetIndex();
-        teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+        teamColorIndex = randomAvailableColorIndex();
       }
       allocationActive = true;
       storageOpen = false;
@@ -403,8 +459,8 @@ function isDayLeader() {
 function updateSharedDayClock(dt) {
   if (!shareConnected) return;
 
-  // Normalize old shared rooms that still carry 10x or 100x.
-  if (shared.timeScale !== 1 && shared.timeScale !== 5) {
+  // Normalize old shared rooms that still carry unsupported speeds.
+  if (shared.timeScale !== 1 && shared.timeScale !== 5 && shared.timeScale !== 10) {
     shared.timeScale = 1;
   }
   const scale = shared.timeScale;
@@ -508,6 +564,20 @@ function resetTracking() {
   localFood = {};
   localFoodDay = 0;
 
+  FIELD_UNITS_ACROSS = FIELD_DEFAULT_UNITS;
+  FIELD_HALF = FIELD_UNITS_ACROSS / 2;
+  FOOD_PER_COLONY = FOOD_PER_COLONY_DEFAULT;
+  speedHits = [];
+  foodMinusHit = null;
+  foodPlusHit = null;
+  fieldSliderHit = null;
+  fieldSliderDrag = false;
+  fieldReseedPending = false;
+  pauseAllHit = null;
+  resetLobbyHit = null;
+  resetLobbyArmedUntil = 0;
+  lastLobbyResetId = 0;
+
   nextOttoId = 1;
   ottos = [];
   fieldEntered = false;
@@ -521,6 +591,7 @@ function resetTracking() {
   lastSyncedElapsed = 0;
   wasDayLeader = false;
   lastSeenTimeScale = 1;
+  timeScale = 1;
   wasPausedForClock = false;
   paused = false;
   pauseDay = 0;
@@ -536,6 +607,11 @@ function resetTracking() {
   spawnHit = null;
   devHits = [];
   nextDevId = 1;
+  devPinOpen = false;
+  devPinEntry = '';
+  devPinErrorUntil = 0;
+  devPinHits = [];
+  devPinCloseHit = null;
   allocationActive = false;
   allocationPoints = {
     attack: 0,
@@ -1018,6 +1094,9 @@ function draw() {
   const dt = constrain(now - lastMillis, 0, 0.1);
   lastMillis = now;
 
+  // Shared dev settings can change the world for every phone.
+  updateSharedDevState();
+
   // The shared day clock runs even before the camera is live, so a connected
   // room keeps the same time even if one phone is not viewing the field.
   updateSharedDayClock(dt);
@@ -1033,6 +1112,7 @@ function draw() {
     drawWaiting(now);
     drawLobbyOverlays();
     drawFullscreenButton();
+    drawDevPinOverlay();
     return;
   }
 
@@ -1105,6 +1185,7 @@ function draw() {
   drawLobbyOverlays();
   if (shareConnected) drawPauseOverlay();
   drawFullscreenButton();
+  drawDevPinOverlay();
 }
 
 // ---------------------------------------------------------------- detection
@@ -1584,8 +1665,42 @@ function clampOttoToField(o) {
   o.pos.y = p.y;
 }
 
+function setFieldUnitsFromSlider(sx) {
+  if (!fieldSliderHit) return;
+  const t = constrain(
+    (sx - fieldSliderHit.trackX) / fieldSliderHit.trackW,
+    0,
+    1
+  );
+  const units = Math.round(
+    FIELD_MIN_UNITS + t * (FIELD_MAX_UNITS - FIELD_MIN_UNITS)
+  );
+  if (applyFieldUnits(units, { broadcast: true })) {
+    fieldReseedPending = true;
+  }
+}
+
 function fieldHalf() {
   return FIELD_HALF;
+}
+
+function applyFieldUnits(value, opts = {}) {
+  const next = Math.round(
+    constrain(value, FIELD_MIN_UNITS, FIELD_MAX_UNITS)
+  );
+  if (next === FIELD_UNITS_ACROSS) return false;
+
+  FIELD_UNITS_ACROSS = next;
+  FIELD_HALF = next / 2;
+
+  // Keep every local Otto inside the new square. Remote phones clamp their
+  // own Ottos when they apply the same shared value.
+  for (const o of ottos) clampOttoToField(o);
+
+  if (opts.broadcast && shareConnected) {
+    shared.fieldUnits = next;
+  }
+  return true;
 }
 
 function enterField() {
@@ -2239,6 +2354,31 @@ function currentFood() {
   return localFood;
 }
 
+function currentFoodPerColony() {
+  if (shareConnected && typeof shared.foodPerColony === 'number') {
+    return Math.round(
+      constrain(
+        shared.foodPerColony,
+        FOOD_PER_COLONY_MIN,
+        FOOD_PER_COLONY_MAX
+      )
+    );
+  }
+  return FOOD_PER_COLONY;
+}
+
+function setFoodPerColony(value) {
+  const next = Math.round(
+    constrain(value, FOOD_PER_COLONY_MIN, FOOD_PER_COLONY_MAX)
+  );
+  FOOD_PER_COLONY = next;
+  if (shareConnected) {
+    shared.foodPerColony = next;
+    // Reseed the current day so the new amount is visible immediately.
+    shared.foodSeedDay = -1;
+  }
+}
+
 // Food is reset once per day: 30 fresh pieces in random positions. There is no
 // continuous timer-based topping up anymore.
 function updateFood(dt) {
@@ -2251,7 +2391,7 @@ function updateFood(dt) {
   const colonies = playerIds().length;
   if (colonies === 0) return;
   const fresh = {};
-  seedFood(fresh, FOOD_PER_COLONY * colonies);
+  seedFood(fresh, currentFoodPerColony() * colonies);
   shared.food = fresh;
   shared.foodSeedDay = shared.day;
 }
@@ -2401,6 +2541,7 @@ function updateRemote(dt) {
       // before the next day starts.
       if (
         autoSkipDay &&
+        !p.forced &&
         Date.now() >= placementRevealUntil &&
         shareClientId &&
         !(p.votes && p.votes[shareClientId])
@@ -2425,6 +2566,7 @@ function updateRemote(dt) {
             day: dayNumber,
             votes: Object.assign({}, votes),
             resumeAt: Date.now() + 10000,
+            forced: !!p.forced,
           };
           p = shared.pause;
         }
@@ -2439,6 +2581,7 @@ function updateRemote(dt) {
           active: true,
           day: dayNumber,
           votes: Object.assign({}, votes),
+          forced: !!p.forced,
         };
       }
     } else if (!p.active || p.day !== dayNumber) {
@@ -2619,7 +2762,7 @@ function resetAllocation() {
   allocationHits = [];
   allocationConfirmHit = null;
   colorHits = [];
-  teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
+  teamColorIndex = randomAvailableColorIndex();
   pendingAssetIndex = randomAssetIndex();
   storageOpen = false;
   storageSelectedId = null;
@@ -2990,6 +3133,14 @@ function drawAllocationScreen() {
   colorHits = [];
   allocationConfirmHit = null;
 
+  // Colours worn by living colonies are unavailable. If a colour became
+  // occupied while the picker was open, move the selection to a free one.
+  const usedColorIndexes = activeColonyColorIndexes();
+  if (usedColorIndexes.has(teamColorIndex)) {
+    const free = availableColorIndexes();
+    if (free.length) teamColorIndex = free[0];
+  }
+
   push();
   noStroke();
   fill(4, 10, 16, 240);
@@ -3095,6 +3246,25 @@ function drawAllocationScreen() {
   for (let i = 0; i < COLONY_COLORS.length; i++) {
     const cx = panelX + swGap * ((i % cols) + 0.5);
     const cy = swCy0 + Math.floor(i / cols) * (swR * 2 + 8);
+    const used = usedColorIndexes.has(i);
+
+    if (used) {
+      // Greyscale swatch with a slash: an active colony already wears it.
+      noStroke();
+      fill(96, 106, 120, 115);
+      circle(cx, cy, swR * 2);
+      stroke(168, 182, 196, 100);
+      strokeWeight(1.2);
+      line(
+        cx - swR * 0.72,
+        cy + swR * 0.72,
+        cx + swR * 0.72,
+        cy - swR * 0.72
+      );
+      noStroke();
+      continue;
+    }
+
     noStroke();
     fill(COLONY_COLORS[i][0], COLONY_COLORS[i][1], COLONY_COLORS[i][2], 230);
     circle(cx, cy, swR * 2);
@@ -3830,6 +4000,69 @@ function colonyColorFor(clientId) {
   return colonyColorMap().get(clientId) || COLONY_COLORS[0];
 }
 
+// Colours already worn by a living colony. The create screen greys these out
+// so two phones cannot pick the same swatch.
+function activeColonyColorIndexes() {
+  const used = new Set();
+  const addIndex = (index) => {
+    if (
+      typeof index === 'number' &&
+      index >= 0 &&
+      index < COLONY_COLORS.length
+    ) {
+      used.add(index);
+    }
+  };
+
+  // Prefer the synced value: teamColorIndex can already belong to the Otto
+  // that is currently being created.
+  if (hasLivingOtto(ottos)) {
+    const syncedIndex = window.me ? window.me.colorIndex : -1;
+    addIndex(
+      typeof syncedIndex === 'number' && syncedIndex >= 0
+        ? syncedIndex
+        : teamColorIndex
+    );
+  }
+
+  if (Array.isArray(guests)) {
+    for (const g of guests) {
+      if (!g || !g.id) continue;
+      const list = Array.isArray(g.ottos) ? g.ottos : g.otto ? [g.otto] : [];
+      if (!hasLivingOtto(list)) continue;
+      if (
+        typeof g.colorIndex === 'number' &&
+        COLONY_COLORS[g.colorIndex]
+      ) {
+        addIndex(g.colorIndex);
+      } else {
+        // Older clients did not broadcast a colour; use the same fallback
+        // their Otto is drawn with.
+        addIndex(COLONY_COLORS.indexOf(colonyColorFor(g.id)));
+      }
+    }
+  }
+
+  return used;
+}
+
+function availableColorIndexes() {
+  const used = activeColonyColorIndexes();
+  const list = [];
+  for (let i = 0; i < COLONY_COLORS.length; i++) {
+    if (!used.has(i)) list.push(i);
+  }
+  return list;
+}
+
+function randomAvailableColorIndex() {
+  const list = availableColorIndexes();
+  if (!list.length) {
+    return Math.floor(Math.random() * COLONY_COLORS.length);
+  }
+  return list[Math.floor(Math.random() * list.length)];
+}
+
 // The Otto sprites are line art: the body is transparent. Tinting with
 // source-atop would only recolour the ink, so the enclosed area is filled
 // separately with a soft colour and drawn behind the line work.
@@ -4365,6 +4598,138 @@ function drawFieldDebug() {
   ctx.restore();
 }
 
+// ------------------------------------------------------------- dev controls
+
+function setTimeScale(scale) {
+  const next = scale === 10 ? 10 : scale === 5 ? 5 : 1;
+  timeScale = next;
+  if (shareConnected) shared.timeScale = next;
+}
+
+function forcedPauseActive() {
+  if (shareConnected) {
+    return !!(
+      shared.pause &&
+      shared.pause.active &&
+      shared.pause.forced
+    );
+  }
+  return paused;
+}
+
+function toggleForcePauseAll() {
+  const day = typeof shared.day === 'number' ? shared.day : dayNumber;
+  if (!shareConnected) {
+    paused = !paused;
+    pauseDay = dayNumber;
+    localReady = false;
+    return;
+  }
+
+  if (forcedPauseActive()) {
+    shared.pause = { active: false, day, votes: {} };
+    paused = false;
+    localReady = false;
+  } else {
+    shared.pause = { active: true, day, votes: {}, forced: true };
+    paused = true;
+    pauseDay = day;
+    localReady = false;
+  }
+}
+
+function updateSharedDevState() {
+  if (!shareConnected) return;
+
+  if (
+    typeof shared.fieldUnits === 'number' &&
+    Math.round(shared.fieldUnits) !== FIELD_UNITS_ACROSS
+  ) {
+    applyFieldUnits(shared.fieldUnits, { broadcast: false });
+  }
+
+  if (typeof shared.foodPerColony === 'number') {
+    FOOD_PER_COLONY = Math.round(
+      constrain(
+        shared.foodPerColony,
+        FOOD_PER_COLONY_MIN,
+        FOOD_PER_COLONY_MAX
+      )
+    );
+  }
+
+  const resetId =
+    typeof shared.lobbyResetId === 'number' ? shared.lobbyResetId : 0;
+  if (resetId > lastLobbyResetId) {
+    lastLobbyResetId = resetId;
+    applyLobbyReset();
+  } else if (resetId < lastLobbyResetId) {
+    lastLobbyResetId = resetId;
+  }
+}
+
+function forceLobbyReset() {
+  if (!shareConnected) {
+    applyLobbyReset();
+    return;
+  }
+
+  const nextId =
+    (typeof shared.lobbyResetId === 'number' ? shared.lobbyResetId : 0) + 1;
+  lastLobbyResetId = nextId;
+  shared.lobbyResetId = nextId;
+  shared.day = 1;
+  shared.dayElapsed = 0;
+  shared.food = {};
+  shared.foodSeedDay = 0;
+  shared.started = false;
+  shared.pause = { active: false, day: 0, votes: {} };
+  applyLobbyReset();
+}
+
+function applyLobbyReset() {
+  ottos = [];
+  if (window.me) {
+    me.ottos = [];
+    me.colorIndex = -1;
+  }
+  remote.clear();
+  localFood = {};
+  localFoodDay = 0;
+
+  dayNumber = 1;
+  dayClock = 0;
+  simClock = 0;
+  lastSyncedElapsed = 0;
+  lastElapsedAt = millis() / 1000;
+  clockSyncTimer = 0;
+  wasDayLeader = false;
+  wasPausedForClock = false;
+  paused = false;
+  pauseDay = 0;
+  localReady = false;
+  fieldEntered = false;
+  showField = false;
+  placementRevealUntil = 0;
+  resetLobbyArmedUntil = 0;
+  fieldSliderDrag = false;
+  fieldReseedPending = false;
+
+  // Reset allocation, placement and examine state in one place.
+  resetAllocation();
+
+  if (storedOttos.length) {
+    allocationActive = false;
+    storageOpen = true;
+    storageDismissed = false;
+    storageSelectedId = storedOttos[0].id;
+    storagePage = 0;
+    storageDiscardArmed = false;
+  }
+
+  syncMe();
+}
+
 // ----------------------------------------------------------------------- hud
 
 function drawHud() {
@@ -4439,10 +4804,15 @@ function drawHud() {
 
   // HUD controls, kept clear of the desktop QR in the top-right corner.
   autoHit = null;
-  timeHit = null;
+  speedHits = [];
   devHit = null;
   spawnHit = null;
   storageHit = null;
+  foodMinusHit = null;
+  foodPlusHit = null;
+  fieldSliderHit = null;
+  pauseAllHit = null;
+  resetLobbyHit = null;
   const rowH = s * 1.9;
   const rowY = 16 + s * 4.85;
 
@@ -4468,33 +4838,40 @@ function drawHud() {
     text(autoLabel, ax + aw / 2, ay + chipH / 2 + 1);
   }
 
-  // Simulation-speed toggle for testing. In a shared room it is global.
-  if (!panel.open) {
+  // Three explicit simulation-speed buttons. Hidden unless dev mode is on.
+  if (!panel.open && devMode) {
     const shownScale =
       shareConnected && typeof shared.timeScale === 'number'
         ? shared.timeScale
         : timeScale;
-    const timeLabel = `${shownScale}×`;
-    textSize(s * 0.58);
-    const tw = textWidth(timeLabel) + 22;
-    const tx = (autoHit ? autoHit.x + autoHit.w : 18) + 12;
-    const ty = chipY;
-    timeHit = { x: tx, y: ty, w: tw, h: chipH };
+    let tx = (autoHit ? autoHit.x + autoHit.w : 18) + 10;
+    for (const scale of [1, 5, 10]) {
+      const label = `${scale}×`;
+      textSize(s * 0.58);
+      const tw = Math.max(28, textWidth(label) + 18);
+      const active = shownScale === scale;
+      speedHits.push({ x: tx, y: chipY, w: tw, h: chipH, scale });
 
-    noFill();
-    stroke(shownScale > 1 ? color(255, 200, 110, 170) : color(140, 230, 255, 85));
-    strokeWeight(1);
-    rect(tx, ty, tw, chipH, chipH / 2);
-    noStroke();
-    fill(shownScale > 1 ? color(255, 200, 110, 230) : color(150, 235, 255, 200));
-    textAlign(CENTER, CENTER);
-    text(timeLabel, tx + tw / 2, ty + chipH / 2 + 1);
+      noFill();
+      stroke(
+        active ? color(255, 200, 110, 180) : color(140, 230, 255, 85)
+      );
+      strokeWeight(1);
+      rect(tx, chipY, tw, chipH, chipH / 2);
+      noStroke();
+      fill(
+        active ? color(255, 200, 110, 235) : color(150, 235, 255, 200)
+      );
+      textAlign(CENTER, CENTER);
+      text(label, tx + tw / 2, chipY + chipH / 2 + 1);
+      tx += tw + 6;
+    }
   }
 
-  // Dev mode (solo only): spawn and edit enemy Ottos.
-  if (!shareConnected && !panel.open) {
+  // Dev mode access. Spawn/edit tools remain solo-only.
+  if (!panel.open) {
     const dy = chipY + chipH + 8;
-    const devLabel = devMode ? 'DEV ON' : 'DEV OFF';
+    const devLabel = devMode ? 'DEV ON' : 'DEV';
     textSize(s * 0.58);
     const dw = textWidth(devLabel) + 22;
     devHit = { x: 18, y: dy, w: dw, h: chipH };
@@ -4508,7 +4885,7 @@ function drawHud() {
     textAlign(CENTER, CENTER);
     text(devLabel, 18 + dw / 2, dy + chipH / 2 + 1);
 
-    if (devMode) {
+    if (devMode && !shareConnected) {
       const spawnLabel = '+ SPAWN ENEMY';
       textSize(s * 0.58);
       const sw = textWidth(spawnLabel) + 24;
@@ -4525,10 +4902,130 @@ function drawHud() {
     }
   }
 
+  // Dev-only shared settings: food, field size, pause and lobby reset.
+  const devRowY = chipY + (chipH + 8) * 2;
+  if (!panel.open && devMode) {
+    // Daily food per active colony.
+    let y = devRowY;
+    textAlign(LEFT, CENTER);
+    textSize(s * 0.55);
+    fill(170, 215, 235, 190);
+    text('FOOD/COLONY', 18, y + chipH / 2);
+    const foodLabelW = textWidth('FOOD/COLONY');
+    let fx = 18 + foodLabelW + 10;
+    const foodValue = String(currentFoodPerColony());
+    textSize(s * 0.62);
+    const foodValueW = Math.max(30, textWidth(foodValue) + 14);
+
+    foodMinusHit = { x: fx, y, w: chipH, h: chipH };
+    noFill();
+    stroke(140, 230, 255, 100);
+    strokeWeight(1);
+    rect(fx, y, chipH, chipH, chipH / 2);
+    noStroke();
+    fill(200, 235, 250, 220);
+    textAlign(CENTER, CENTER);
+    textSize(s * 0.72);
+    text('−', fx + chipH / 2, y + chipH / 2 + 1);
+    fx += chipH + 6;
+
+    noFill();
+    stroke(140, 230, 255, 90);
+    strokeWeight(1);
+    rect(fx, y, foodValueW, chipH, 6);
+    noStroke();
+    fill(240, 252, 255, 235);
+    textSize(s * 0.62);
+    text(foodValue, fx + foodValueW / 2, y + chipH / 2 + 1);
+    fx += foodValueW + 6;
+
+    foodPlusHit = { x: fx, y, w: chipH, h: chipH };
+    noFill();
+    stroke(140, 230, 255, 100);
+    strokeWeight(1);
+    rect(fx, y, chipH, chipH, chipH / 2);
+    noStroke();
+    fill(200, 235, 250, 220);
+    textAlign(CENTER, CENTER);
+    textSize(s * 0.72);
+    text('+', fx + chipH / 2, y + chipH / 2 + 1);
+
+    // Field-size slider.
+    y += chipH + 8;
+    textAlign(LEFT, CENTER);
+    textSize(s * 0.55);
+    fill(170, 215, 235, 190);
+    const fieldLabel = `FIELD SIZE ${FIELD_UNITS_ACROSS}`;
+    text(fieldLabel, 18, y + chipH / 2);
+    textSize(s * 0.55);
+    const fieldLabelW = textWidth(fieldLabel);
+    const trackX = 18 + fieldLabelW + 12;
+    const trackW = Math.max(60, Math.min(180, width - trackX - 20));
+    const trackY = y + chipH / 2;
+    fieldSliderHit = {
+      x: trackX - 8,
+      y,
+      w: trackW + 16,
+      h: chipH,
+      trackX,
+      trackW,
+    };
+
+    noStroke();
+    fill(255, 255, 255, 28);
+    rect(trackX, trackY - 2, trackW, 4, 2);
+    const t = constrain(
+      (FIELD_UNITS_ACROSS - FIELD_MIN_UNITS) /
+        (FIELD_MAX_UNITS - FIELD_MIN_UNITS),
+      0,
+      1
+    );
+    fill(255, 200, 110, 190);
+    rect(trackX, trackY - 2, trackW * t, 4, 2);
+    fill(255, 200, 110, 230);
+    circle(trackX + trackW * t, trackY, 12);
+
+    // Pause-all and lobby-reset buttons.
+    y += chipH + 8;
+    const pausedByDev = forcedPauseActive();
+    const pauseLabel = pausedByDev ? 'RESUME ALL' : 'PAUSE ALL';
+    textSize(s * 0.58);
+    const pauseW = textWidth(pauseLabel) + 22;
+    pauseAllHit = { x: 18, y, w: pauseW, h: chipH };
+    noFill();
+    stroke(
+      pausedByDev ? color(126, 255, 190, 170) : color(255, 200, 110, 130)
+    );
+    strokeWeight(1);
+    rect(18, y, pauseW, chipH, chipH / 2);
+    noStroke();
+    fill(
+      pausedByDev ? color(126, 255, 190, 230) : color(255, 200, 110, 220)
+    );
+    textAlign(CENTER, CENTER);
+    text(pauseLabel, 18 + pauseW / 2, y + chipH / 2 + 1);
+
+    const armed = millis() < resetLobbyArmedUntil;
+    const resetLabel = armed ? 'CONFIRM RESET' : 'RESET LOBBY';
+    textSize(s * 0.58);
+    const resetW = textWidth(resetLabel) + 22;
+    const resetX = 18 + pauseW + 10;
+    resetLobbyHit = { x: resetX, y, w: resetW, h: chipH };
+    noFill();
+    stroke(armed ? color(255, 120, 110, 200) : color(255, 150, 140, 110));
+    strokeWeight(1);
+    rect(resetX, y, resetW, chipH, chipH / 2);
+    noStroke();
+    fill(armed ? color(255, 120, 110, 235) : color(255, 150, 140, 190));
+    textAlign(CENTER, CENTER);
+    text(resetLabel, resetX + resetW / 2, y + chipH / 2 + 1);
+  }
+
   // Storage button. This opens the reserve; placement rules are handled inside.
   storageHit = null;
   if (!panel.open && !placementActive && !placementQueued && !storageOpen) {
-    const dy = chipY + chipH + 8;
+    const dy =
+      chipY + (chipH + 8) * 2 + (devMode ? (chipH + 8) * 3 : 0);
     const count = storedOttos.length;
     const storageLabel = count ? `STORAGE · ${count}` : 'STORAGE';
     textSize(s * 0.58);
@@ -4560,6 +5057,188 @@ function drawHud() {
     text('POINT AT THE FULL GREEN TAPE SQUARE', width / 2, height - 20);
   }
 
+  pop();
+}
+
+function setDevMode(on) {
+  devMode = !!on;
+  if (!devMode) {
+    setTimeScale(1);
+    if (shareConnected && forcedPauseActive()) {
+      shared.pause = { active: false, day: dayNumber, votes: {} };
+      paused = false;
+      localReady = false;
+    }
+    resetLobbyArmedUntil = 0;
+    fieldSliderDrag = false;
+    if (fieldReseedPending) {
+      fieldReseedPending = false;
+      if (shareConnected) shared.foodSeedDay = -1;
+      else localFoodDay = -1;
+    }
+  }
+}
+
+function openDevPin() {
+  devPinOpen = true;
+  devPinEntry = '';
+  devPinErrorUntil = 0;
+}
+
+function closeDevPin() {
+  devPinOpen = false;
+  devPinEntry = '';
+  devPinErrorUntil = 0;
+}
+
+function addDevPinDigit(digit) {
+  if (devPinEntry.length >= 4) return;
+  devPinEntry += digit;
+  if (devPinEntry.length === 4) {
+    if (devPinEntry === DEV_PIN) {
+      setDevMode(true);
+      closeDevPin();
+    } else {
+      devPinEntry = '';
+      devPinErrorUntil = millis() + 1400;
+    }
+  }
+}
+
+function handleDevPinPress() {
+  if (hitRect(devPinCloseHit, mouseX, mouseY)) {
+    closeDevPin();
+    return;
+  }
+  for (const hit of devPinHits) {
+    if (!hitRect(hit, mouseX, mouseY)) continue;
+    if (hit.action === 'digit') addDevPinDigit(hit.value);
+    else if (hit.action === 'clear') devPinEntry = '';
+    else if (hit.action === 'back') {
+      devPinEntry = devPinEntry.slice(0, -1);
+    }
+    return;
+  }
+}
+
+function drawDevPinOverlay() {
+  if (!devPinOpen) return;
+  devPinHits = [];
+  devPinCloseHit = null;
+
+  const s = constrain(width * 0.031, 10, 16);
+  const panelW = Math.min(width - 40, 330);
+  const panelH = Math.min(height - 60, 470);
+  const panelX = (width - panelW) / 2;
+  const panelY = (height - panelH) / 2;
+
+  push();
+  noStroke();
+  fill(4, 10, 16, 220);
+  rect(0, 0, width, height);
+  fill(7, 14, 22, 245);
+  rect(panelX, panelY, panelW, panelH, 14);
+  stroke(140, 230, 255, 70);
+  strokeWeight(1);
+  noFill();
+  rect(panelX, panelY, panelW, panelH, 14);
+  noStroke();
+
+  fill(240, 252, 255, 235);
+  textAlign(CENTER, TOP);
+  textSize(Math.max(15, s * 1.05));
+  text('DEV ACCESS', width / 2, panelY + 14);
+  fill(150, 205, 230, 190);
+  textSize(Math.max(9, s * 0.55));
+  text('ENTER 4-DIGIT PIN', width / 2, panelY + 14 + s * 1.45);
+
+  const closeSize = Math.max(32, s * 2);
+  const closeX = panelX + panelW - closeSize - 8;
+  const closeY = panelY + 8;
+  devPinCloseHit = { x: closeX, y: closeY, w: closeSize, h: closeSize };
+  noFill();
+  stroke(140, 230, 255, 100);
+  strokeWeight(1);
+  circle(closeX + closeSize / 2, closeY + closeSize / 2, closeSize);
+  stroke(180, 240, 255, 220);
+  strokeWeight(1.5);
+  const cross = closeSize * 0.24;
+  const ccx = closeX + closeSize / 2;
+  const ccy = closeY + closeSize / 2;
+  line(ccx - cross, ccy - cross, ccx + cross, ccy + cross);
+  line(ccx + cross, ccy - cross, ccx - cross, ccy + cross);
+  noStroke();
+
+  const pinW = panelW - 60;
+  const pinH = Math.max(44, s * 3.1);
+  const pinX = panelX + 30;
+  const pinY = panelY + 66;
+  fill(255, 255, 255, 14);
+  rect(pinX, pinY, pinW, pinH, 8);
+  noFill();
+  stroke(
+    millis() < devPinErrorUntil
+      ? color(255, 130, 120, 170)
+      : color(140, 230, 255, 90)
+  );
+  strokeWeight(1);
+  rect(pinX, pinY, pinW, pinH, 8);
+  noStroke();
+  fill(240, 252, 255, 235);
+  textAlign(CENTER, CENTER);
+  textSize(Math.max(18, s * 1.6));
+  text(
+    devPinEntry.padEnd(4, '_').split('').join(' '),
+    pinX + pinW / 2,
+    pinY + pinH / 2 + 1
+  );
+
+  const errorY = pinY + pinH + 8;
+  if (millis() < devPinErrorUntil) {
+    fill(255, 130, 120, 220);
+    textAlign(CENTER, TOP);
+    textSize(Math.max(10, s * 0.6));
+    text('WRONG PIN', width / 2, errorY);
+  }
+
+  const gap = 8;
+  const keyTop = errorY + Math.max(16, s * 0.9);
+  const keyW = (panelW - 40 - gap * 2) / 3;
+  const available = panelY + panelH - 20 - keyTop;
+  const keyH = Math.min(54, (available - gap * 3) / 4);
+  const rows = [
+    ['1', '2', '3'],
+    ['4', '5', '6'],
+    ['7', '8', '9'],
+    ['CLR', '0', 'DEL'],
+  ];
+
+  for (let r = 0; r < rows.length; r++) {
+    for (let c = 0; c < 3; c++) {
+      const label = rows[r][c];
+      const bx = panelX + 20 + c * (keyW + gap);
+      const by = keyTop + r * (keyH + gap);
+      const action =
+        label === 'CLR' ? 'clear' : label === 'DEL' ? 'back' : 'digit';
+      devPinHits.push({
+        x: bx,
+        y: by,
+        w: keyW,
+        h: keyH,
+        action,
+        value: label,
+      });
+      noFill();
+      stroke(140, 230, 255, 90);
+      strokeWeight(1);
+      rect(bx, by, keyW, keyH, 8);
+      noStroke();
+      fill(200, 235, 250, 225);
+      textAlign(CENTER, CENTER);
+      textSize(Math.max(12, s * 0.82));
+      text(label, bx + keyW / 2, by + keyH / 2 + 1);
+    }
+  }
   pop();
 }
 
@@ -4710,10 +5389,16 @@ function castLocalYes() {
   if (shareClientId) votes[shareClientId] = true;
   const next = { active: true, day: dayNumber, votes };
   if (p.resumeAt) next.resumeAt = p.resumeAt;
+  if (p.forced) next.forced = true;
   shared.pause = next;
 }
 
 function mousePressed() {
+  if (devPinOpen) {
+    handleDevPinPress();
+    return false;
+  }
+
   if (hitRect(fullscreenHit, mouseX, mouseY)) {
     togglePageFullscreen();
     return false;
@@ -4857,14 +5542,53 @@ function mousePressed() {
     }
   }
 
-  if (hitRect(timeHit, mouseX, mouseY)) {
-    const current =
-      shareConnected && typeof shared.timeScale === 'number'
-        ? shared.timeScale
-        : timeScale;
-    const next = current === 1 ? 5 : 1;
-    timeScale = next;
-    if (shareConnected) shared.timeScale = next;
+  if (devMode) {
+    for (const h of speedHits) {
+      if (hitRect(h, mouseX, mouseY)) {
+        setTimeScale(h.scale);
+        return false;
+      }
+    }
+
+    if (hitRect(foodMinusHit, mouseX, mouseY)) {
+      setFoodPerColony(currentFoodPerColony() - FOOD_PER_COLONY_STEP);
+      return false;
+    }
+    if (hitRect(foodPlusHit, mouseX, mouseY)) {
+      setFoodPerColony(currentFoodPerColony() + FOOD_PER_COLONY_STEP);
+      return false;
+    }
+
+    if (hitRect(fieldSliderHit, mouseX, mouseY)) {
+      fieldSliderDrag = true;
+      setFieldUnitsFromSlider(mouseX);
+      return false;
+    }
+
+    if (hitRect(pauseAllHit, mouseX, mouseY)) {
+      toggleForcePauseAll();
+      return false;
+    }
+
+    if (hitRect(resetLobbyHit, mouseX, mouseY)) {
+      if (millis() < resetLobbyArmedUntil) {
+        resetLobbyArmedUntil = 0;
+        forceLobbyReset();
+      } else {
+        resetLobbyArmedUntil = millis() + 3000;
+      }
+      return false;
+    }
+  }
+
+  if (hitRect(devHit, mouseX, mouseY)) {
+    if (devMode) setDevMode(false);
+    else openDevPin();
+    return false;
+  }
+
+  if (devMode && !shareConnected && hitRect(spawnHit, mouseX, mouseY)) {
+    spawnDevEnemy();
     return false;
   }
 
@@ -4905,12 +5629,34 @@ function mousePressed() {
 }
 
 function mouseDragged() {
+  if (devMode && fieldSliderDrag) {
+    setFieldUnitsFromSlider(mouseX);
+    return false;
+  }
   if (panel.open && panel.drag) setStatFromX(panel.drag, mouseX);
   return false;
 }
 
 function mouseReleased() {
   panel.drag = null;
+  fieldSliderDrag = false;
+  if (fieldReseedPending) {
+    fieldReseedPending = false;
+    if (shareConnected) shared.foodSeedDay = -1;
+    else localFoodDay = -1;
+  }
+  return false;
+}
+
+function keyPressed() {
+  if (!devPinOpen) return;
+  if (key && /^[0-9]$/.test(key)) {
+    addDevPinDigit(key);
+  } else if (keyCode === BACKSPACE) {
+    devPinEntry = devPinEntry.slice(0, -1);
+  } else if (keyCode === ESCAPE) {
+    closeDevPin();
+  }
   return false;
 }
 
@@ -4933,7 +5679,13 @@ function resetUiHits() {
   placementCancelHit = null;
   yesHit = null;
   autoHit = null;
-  timeHit = null;
+  speedHits = [];
+  foodMinusHit = null;
+  foodPlusHit = null;
+  fieldSliderHit = null;
+  fieldSliderDrag = false;
+  pauseAllHit = null;
+  resetLobbyHit = null;
 }
 
 function windowResized() {
@@ -5005,6 +5757,7 @@ function drawFullscreenButton() {
     storageOpen ||
     placementActive ||
     placementQueued ||
+    devPinOpen ||
     panel.open ||
     !fullscreenAvailable()
   ) {
