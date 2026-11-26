@@ -172,13 +172,25 @@ let placementRevealUntil = 0;
 let placementMode = 'new'; // 'new' or 'stored'
 let colonySpawned = false;
 let colonyLost = false;
-let storedOtto = null;
-let lobbyChoiceActive = false;
-let storedPlaceHit = null;
-let scratchHit = null;
+let storedOttos = [];
+let storageOpen = false;
+let storageDismissed = false;
+let storageSelectedId = null;
+let storagePage = 0;
+let storageDiscardArmed = false;
+let pendingStoredId = null;
 let storageHit = null;
 let storeHit = null;
-const STORAGE_KEY = 'otto-stored-v1';
+let storageHits = [];
+let storageCloseHit = null;
+let storageNewHit = null;
+let storageBackHit = null;
+let storagePlaceHit = null;
+let storageDiscardHit = null;
+let storagePrevHit = null;
+let storageNextHit = null;
+const STORAGE_KEY = 'otto-stored-v2';
+const LEGACY_STORAGE_KEY = 'otto-stored-v1';
 
 async function setup() {
   createCanvas(windowWidth, windowHeight);
@@ -232,7 +244,7 @@ async function setup() {
   }
 
   resetTracking();
-  loadStoredOtto();
+  loadStoredOttos();
   lastMillis = millis() / 1000;
 
   cam = createPhoneCamera('environment', false, 'cover');
@@ -270,16 +282,17 @@ function shareReady() {
   // No colony yet: start the local create/place flow. Late joiners also get
   // this flow while the shared day clock keeps running.
   if (!colonySpawned && ottos.length === 0 && !placementActive) {
-    if (storedOtto) {
+    if (storedOttos.length) {
       allocationActive = false;
-      lobbyChoiceActive = true;
+      storageOpen = true;
+      storageDismissed = false;
     } else {
       if (!allocationActive) {
         pendingAssetIndex = randomAssetIndex();
         teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
       }
       allocationActive = true;
-      lobbyChoiceActive = false;
+      storageOpen = false;
     }
   }
 
@@ -538,12 +551,23 @@ function resetTracking() {
   placementMode = 'new';
   colonySpawned = false;
   colonyLost = false;
-  storedOtto = null;
-  lobbyChoiceActive = false;
-  storedPlaceHit = null;
-  scratchHit = null;
+  storedOttos = [];
+  storageOpen = false;
+  storageDismissed = false;
+  storageSelectedId = null;
+  storagePage = 0;
+  storageDiscardArmed = false;
+  pendingStoredId = null;
   storageHit = null;
   storeHit = null;
+  storageHits = [];
+  storageCloseHit = null;
+  storageNewHit = null;
+  storageBackHit = null;
+  storagePlaceHit = null;
+  storageDiscardHit = null;
+  storagePrevHit = null;
+  storageNextHit = null;
   reconnectHit = null;
   failRetryHit = null;
 }
@@ -840,7 +864,7 @@ function drawStatsCard() {
   const need = energyRequirementFor(st.size);
   const editable = devMode && !shareConnected;
   const canStore =
-    shareConnected && paused && isLocal && refUsable && !ref.dead && !storedOtto;
+    shareConnected && paused && isLocal && refUsable && !ref.dead;
 
   const s = constrain(width * 0.031, 10, 16);
   const cardW = editable ? s * 18 : s * 15.5;
@@ -1049,12 +1073,13 @@ function draw() {
     !allocationActive &&
     !placementActive &&
     !placementQueued &&
-    !lobbyChoiceActive
+    !storageOpen
   ) {
-    if (storedOtto) {
-      lobbyChoiceActive = true;
+    if (storedOttos.length && !storageDismissed) {
+      storageOpen = true;
+      storageDismissed = false;
       colonyLost = false;
-    } else {
+    } else if (!storedOttos.length) {
       colonyLost = true;
     }
   }
@@ -1631,9 +1656,9 @@ function processColonyDayEnd() {
   for (const parent of parents) reproduce(parent);
 
   for (const o of ottos) o.energy = 0;
-  if (storedOtto) {
-    storedOtto.energy = 0;
-    saveStoredOtto();
+  if (storedOttos.length) {
+    for (const o of storedOttos) o.energy = 0;
+    saveStoredOttos();
   }
 
   if (ottos.length > before) {
@@ -2409,7 +2434,7 @@ function numberOr(v, fallback) {
 function drawPauseOverlay() {
   // The creation screens already have full layouts; they must not be covered
   // by the pause card.
-  if (allocationActive || lobbyChoiceActive) {
+  if (allocationActive || storageOpen) {
     yesHit = null;
     return;
   }
@@ -2522,9 +2547,10 @@ function resetAllocation() {
   colorHits = [];
   teamColorIndex = Math.floor(Math.random() * COLONY_COLORS.length);
   pendingAssetIndex = randomAssetIndex();
-  lobbyChoiceActive = false;
-  storedPlaceHit = null;
-  scratchHit = null;
+  storageOpen = false;
+  storageSelectedId = null;
+  storageDiscardArmed = false;
+  pendingStoredId = null;
   pendingStats = null;
   pendingMaxHp = MAX_HP;
   placementActive = false;
@@ -2541,23 +2567,28 @@ function resetAllocation() {
   examineLeaving = false;
 }
 
-function saveStoredOtto() {
+function storedOttoData(o) {
+  return {
+    id: o.id,
+    stats: o.stats,
+    hp: o.hp,
+    maxHp: o.maxHp,
+    energy: o.energy,
+    assetIndex: o.assetIndex,
+  };
+}
+
+function saveStoredOttos() {
   try {
-    if (!storedOtto) {
+    if (!storedOttos.length) {
       localStorage.removeItem(STORAGE_KEY);
       return;
     }
-    const o = storedOtto;
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
-        id: o.id,
-        stats: o.stats,
-        hp: o.hp,
-        maxHp: o.maxHp,
-        energy: o.energy,
-        assetIndex: o.assetIndex,
         colorIndex: teamColorIndex,
+        ottos: storedOttos.map(storedOttoData),
       })
     );
   } catch (e) {
@@ -2565,46 +2596,81 @@ function saveStoredOtto() {
   }
 }
 
-function loadStoredOtto() {
+function createStoredOtto(s) {
+  const o = createOtto(
+    s.stats,
+    0,
+    0,
+    s.maxHp || MAX_HP,
+    s.assetIndex == null ? null : s.assetIndex
+  );
+  o.id = numberOr(s.id, o.id);
+  o.hp = constrain(numberOr(s.hp, o.maxHp), 1, o.maxHp);
+  o.energy = Math.max(0, numberOr(s.energy, 0));
+  o.mode = 'stored';
+  return o;
+}
+
+function loadStoredOttos() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    const s = JSON.parse(raw);
-    if (!s || !s.stats) {
-      localStorage.removeItem(STORAGE_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      const list = Array.isArray(data)
+        ? data
+        : Array.isArray(data && data.ottos)
+        ? data.ottos
+        : [];
+      if (data && typeof data.colorIndex === 'number' && COLONY_COLORS[data.colorIndex]) {
+        teamColorIndex = data.colorIndex;
+      }
+      storedOttos = [];
+      for (const s of list) {
+        if (!s || !s.stats) continue;
+        const o = createStoredOtto(s);
+        if (storedOttos.some((entry) => entry.id === o.id)) {
+          o.id = nextOttoId++;
+        }
+        storedOttos.push(o);
+        nextOttoId = Math.max(nextOttoId, o.id + 1);
+      }
       return;
     }
-    const o = createOtto(
-      s.stats,
-      0,
-      0,
-      s.maxHp || MAX_HP,
-      s.assetIndex == null ? null : s.assetIndex
-    );
-    o.id = numberOr(s.id, o.id);
-    o.hp = constrain(numberOr(s.hp, o.maxHp), 1, o.maxHp);
-    o.energy = Math.max(0, numberOr(s.energy, 0));
-    if (typeof s.colorIndex === 'number' && COLONY_COLORS[s.colorIndex]) {
-      teamColorIndex = s.colorIndex;
+
+    // Migrate the old single-slot storage.
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!legacy) return;
+    const s = JSON.parse(legacy);
+    if (s && s.stats) {
+      if (typeof s.colorIndex === 'number' && COLONY_COLORS[s.colorIndex]) {
+        teamColorIndex = s.colorIndex;
+      }
+      const o = createStoredOtto(s);
+      storedOttos = [o];
+      nextOttoId = Math.max(nextOttoId, o.id + 1);
+      saveStoredOttos();
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
     }
-    nextOttoId = Math.max(nextOttoId, o.id + 1);
-    storedOtto = o;
   } catch (e) {
+    storedOttos = [];
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch (e2) {}
   }
 }
 
-function clearStoredOtto() {
-  storedOtto = null;
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch (e) {}
+function getStoredOtto(id) {
+  return storedOttos.find((o) => o.id === id) || null;
+}
+
+function removeStoredOtto(id) {
+  storedOttos = storedOttos.filter((o) => o.id !== id);
+  if (storageSelectedId === id) storageSelectedId = null;
+  saveStoredOttos();
 }
 
 function storeOtto(o) {
-  if (!shareConnected || !paused || storedOtto || !o || o.dead) return;
+  if (!shareConnected || !paused || !o || o.dead) return;
   const index = ottos.indexOf(o);
   if (index < 0) return;
 
@@ -2617,25 +2683,30 @@ function storeOtto(o) {
   o.wander = null;
   o.think = 0;
   o.fightCd = 0;
+  o.hurtUntil = 0;
   o.fleeThreat = null;
   o.fleeUntil = 0;
   o.chaseIgnoreId = null;
   o.chaseIgnoreUntil = 0;
   o.chaseStartDist = 0;
   o.chaseElapsed = 0;
-  storedOtto = o;
-  saveStoredOtto();
+  storedOttos.push(o);
+  saveStoredOttos();
   dismissExamine();
   syncMe();
   if (ottos.length === 0) {
-    lobbyChoiceActive = true;
+    storageOpen = true;
+    storageDismissed = false;
+    storageSelectedId = o.id;
+    storageDiscardArmed = false;
     colonyLost = false;
   }
 }
 
 function placeStoredOtto(fx, fy) {
-  if (!storedOtto) return;
-  const o = storedOtto;
+  const o = getStoredOtto(pendingStoredId);
+  if (!o) return;
+  pendingStoredId = null;
   const p = clampToField(
     fx,
     fy,
@@ -2663,13 +2734,15 @@ function placeStoredOtto(fx, fy) {
   ottos.push(o);
   fieldEntered = true;
 
-  clearStoredOtto();
+  removeStoredOtto(o.id);
   colonySpawned = true;
   placementActive = false;
   placementQueued = false;
   queuedPlacement = null;
   placementMode = 'new';
-  lobbyChoiceActive = false;
+  storageOpen = false;
+  storageDismissed = false;
+  storageSelectedId = null;
   allocationActive = false;
   colonyLost = false;
   shared.started = true;
@@ -2700,6 +2773,7 @@ function placeNewOttoAt(fx, fy) {
   allocationActive = false;
   fieldEntered = true;
   shared.started = true;
+  storageDismissed = false;
   placementRevealUntil = Date.now() + PLACEMENT_REVEAL_MS;
   if (window.me) me.colorIndex = teamColorIndex;
   syncMe();
@@ -2710,31 +2784,40 @@ function commitQueuedPlacement() {
   const q = queuedPlacement;
   queuedPlacement = null;
   placementQueued = false;
-  if (q.mode === 'stored') placeStoredOtto(q.x, q.y);
-  else placeNewOttoAt(q.x, q.y);
+  if (q.mode === 'stored') {
+    pendingStoredId = q.storedId;
+    placeStoredOtto(q.x, q.y);
+  } else {
+    placeNewOttoAt(q.x, q.y);
+  }
 }
 
 function cancelQueuedPlacement() {
   const wasStored =
     (queuedPlacement && queuedPlacement.mode === 'stored') ||
     placementMode === 'stored';
+  const storedId = queuedPlacement && queuedPlacement.storedId;
   placementQueued = false;
   queuedPlacement = null;
   placementActive = false;
   placementCancelHit = null;
-  if (wasStored && storedOtto) {
-    lobbyChoiceActive = true;
+  if (wasStored) {
+    storageOpen = true;
+    storageSelectedId = storedId || pendingStoredId;
+    storageDiscardArmed = false;
     allocationActive = false;
   } else {
-    lobbyChoiceActive = false;
+    storageOpen = false;
     allocationActive = true;
     placementMode = 'new';
   }
+  pendingStoredId = null;
 }
 
 function startFromScratch() {
-  clearStoredOtto();
-  lobbyChoiceActive = false;
+  if (ottos.length) return;
+  storageOpen = false;
+  storageSelectedId = null;
   colonySpawned = false;
   colonyLost = false;
   placementActive = false;
@@ -3092,87 +3175,441 @@ function drawColonyLostScreen() {
   pop();
 }
 
-function drawStoredChoiceScreen() {
-  if (!storedOtto) return;
+function storedAssetFor(o) {
+  return o.assetIndex == null
+    ? ottoAssetFor(o.id)
+    : ottoAssets[o.assetIndex] || ottoAssetFor(o.id);
+}
+
+function openStorage() {
+  storageOpen = true;
+  storageDismissed = false;
+  storageSelectedId = null;
+  storagePage = 0;
+  storageDiscardArmed = false;
+  if (examineClone) dismissExamine();
+}
+
+function closeStorage() {
+  storageOpen = false;
+  storageDismissed = true;
+  storageSelectedId = null;
+  storageDiscardArmed = false;
+}
+
+function drawStoragePanel() {
+  storageHits = [];
+  storageCloseHit = null;
+  storageNewHit = null;
+  storageBackHit = null;
+  storagePlaceHit = null;
+  storageDiscardHit = null;
+  storagePrevHit = null;
+  storageNextHit = null;
+
+  const s = constrain(width * 0.031, 10, 16);
+  const pad = Math.max(12, s * 0.9);
+  const panelW = Math.min(width - 20, 760);
+  const panelH = Math.min(height - 40, 620);
+  const panelX = (width - panelW) / 2;
+  const panelY = (height - panelH) / 2;
 
   push();
   noStroke();
-  fill(4, 10, 16, 228);
+  fill(4, 10, 16, 155);
   rect(0, 0, width, height);
-  textAlign(CENTER, CENTER);
+  fill(7, 14, 22, 220);
+  rect(panelX, panelY, panelW, panelH, 16);
+  stroke(140, 230, 255, 55);
+  strokeWeight(1);
+  noFill();
+  rect(panelX, panelY, panelW, panelH, 16);
+  noStroke();
+
+  const headerH = Math.max(50, s * 3.2);
+  const footerH = Math.max(58, s * 3.4);
   fill(240, 252, 255, 235);
-  textSize(constrain(width * 0.075, 24, 42));
-  text(
-    colonySpawned ? 'OTTO IN STORAGE' : 'WELCOME BACK',
-    width / 2,
-    height * 0.28
-  );
+  textAlign(LEFT, TOP);
+  textSize(Math.max(15, s * 1.1));
+  text('OTTO STORAGE', panelX + pad, panelY + 12);
+  fill(126, 255, 190, 200);
+  textSize(Math.max(10, s * 0.62));
+  text(`${storedOttos.length} STORED`, panelX + pad, panelY + 12 + s * 1.55);
 
-  const previewY = height * 0.47;
-  drawOttoPreview(
-    width / 2,
-    previewY,
-    Math.min(120, height * 0.16),
-    COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0],
-    storedOtto.assetIndex == null
-      ? ottoAssetFor(storedOtto.id)
-      : ottoAssets[storedOtto.assetIndex] || ottoAssetFor(storedOtto.id)
-  );
+  const closeSize = Math.max(34, s * 2.2);
+  const closeX = panelX + panelW - closeSize - 8;
+  const closeY = panelY + 8;
+  storageCloseHit = { x: closeX, y: closeY, w: closeSize, h: closeSize };
+  noFill();
+  stroke(140, 230, 255, 110);
+  strokeWeight(1);
+  circle(closeX + closeSize / 2, closeY + closeSize / 2, closeSize);
+  stroke(180, 240, 255, 220);
+  strokeWeight(1.6);
+  const cross = closeSize * 0.24;
+  const ccx = closeX + closeSize / 2;
+  const ccy = closeY + closeSize / 2;
+  line(ccx - cross, ccy - cross, ccx + cross, ccy + cross);
+  line(ccx + cross, ccy - cross, ccx - cross, ccy + cross);
+  noStroke();
 
-  fill(180, 220, 240, 190);
-  textSize(constrain(width * 0.035, 11, 16));
-  text('You have a stored Otto ready to place.', width / 2, height * 0.56);
+  const contentX = panelX + pad;
+  const contentY = panelY + headerH;
+  const contentW = panelW - pad * 2;
+  const contentH = panelH - headerH - footerH;
+  const footerY = panelY + panelH - footerH;
+
+  if (storageSelectedId != null && !getStoredOtto(storageSelectedId)) {
+    storageSelectedId = null;
+    storageDiscardArmed = false;
+  }
+  const selected = getStoredOtto(storageSelectedId);
+  if (selected) {
+    drawStorageDetail(
+      selected,
+      contentX,
+      contentY,
+      contentW,
+      contentH,
+      footerY,
+      footerH,
+      s
+    );
+  } else {
+    drawStorageGrid(
+      contentX,
+      contentY,
+      contentW,
+      contentH,
+      footerY,
+      footerH,
+      s
+    );
+  }
+  pop();
+}
+
+function drawStoragePill(bx, by, bw, bh, label, enabled, tone) {
+  const c = enabled ? tone : [90, 105, 120];
+  noFill();
+  stroke(c[0], c[1], c[2], enabled ? 170 : 90);
+  strokeWeight(1);
+  rect(bx, by, bw, bh, bh / 2);
+  noStroke();
+  fill(c[0], c[1], c[2], enabled ? 230 : 140);
+  textAlign(CENTER, CENTER);
+  textSize(Math.max(10, bh * 0.32));
+  text(label, bx + bw / 2, by + bh / 2 + 1);
+}
+
+function drawStorageGrid(
+  contentX,
+  contentY,
+  contentW,
+  contentH,
+  footerY,
+  footerH,
+  s
+) {
+  if (!storedOttos.length) {
+    fill(180, 220, 240, 170);
+    textAlign(CENTER, CENTER);
+    textSize(Math.max(12, s * 0.85));
+    text('NO STORED OTTOS', width / 2, contentY + contentH * 0.42);
+    textSize(Math.max(10, s * 0.62));
+    text(
+      'STORE AN OTTO DURING A PAUSE',
+      width / 2,
+      contentY + contentH * 0.42 + s * 1.4
+    );
+  }
+
+  const gap = Math.max(8, s * 0.7);
+  const cols = width > 620 ? 4 : 3;
+  const rows = Math.max(
+    1,
+    Math.min(3, Math.floor((contentH + gap) / (120 + gap)))
+  );
+  const cardW = (contentW - gap * (cols - 1)) / cols;
+  const cardH = (contentH - gap * (rows - 1)) / rows;
+  const perPage = cols * rows;
+  const pageCount = Math.max(1, Math.ceil(storedOttos.length / perPage));
+  storagePage = constrain(storagePage, 0, pageCount - 1);
+  const start = storagePage * perPage;
+  const list = storedOttos.slice(start, start + perPage);
+  const color = COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0];
+
+  for (let i = 0; i < list.length; i++) {
+    const o = list[i];
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const bx = contentX + col * (cardW + gap);
+    const by = contentY + row * (cardH + gap);
+    storageHits.push({ x: bx, y: by, w: cardW, h: cardH, id: o.id });
+
+    fill(255, 255, 255, 14);
+    rect(bx, by, cardW, cardH, 10);
+    noFill();
+    stroke(140, 230, 255, 55);
+    strokeWeight(1);
+    rect(bx, by, cardW, cardH, 10);
+    noStroke();
+
+    const previewH = Math.min(cardH * 0.5, 90);
+    drawOttoPreview(
+      bx + cardW / 2,
+      by + cardH - 32,
+      previewH,
+      color,
+      storedAssetFor(o)
+    );
+    fill(240, 252, 255, 225);
+    textAlign(CENTER, CENTER);
+    textSize(Math.max(9, s * 0.55));
+    text(`OTTO #${o.id}`, bx + cardW / 2, by + cardH - 20);
+    fill(126, 255, 190, 190);
+    textSize(Math.max(9, s * 0.5));
+    text(
+      `HP ${Math.round(o.hp)}/${o.maxHp}`,
+      bx + cardW / 2,
+      by + cardH - 8
+    );
+  }
+
+  const by = footerY + 8;
+  const bh = footerH - 16;
+  storageNewHit = null;
+  if (!ottos.length) {
+    const newW = Math.min(220, contentW * 0.55);
+    storageNewHit = { x: contentX, y: by, w: newW, h: bh };
+    drawStoragePill(
+      contentX,
+      by,
+      newW,
+      bh,
+      'NEW OTTO',
+      true,
+      [255, 205, 120]
+    );
+  }
+
+  if (pageCount > 1) {
+    const arrowW = Math.max(34, s * 2.2);
+    const nextX = contentX + contentW - arrowW;
+    const prevX = nextX - arrowW - 8;
+    storagePrevHit = { x: prevX, y: by, w: arrowW, h: bh };
+    storageNextHit = { x: nextX, y: by, w: arrowW, h: bh };
+    drawStoragePill(
+      prevX,
+      by,
+      arrowW,
+      bh,
+      '<',
+      storagePage > 0,
+      [140, 230, 255]
+    );
+    drawStoragePill(
+      nextX,
+      by,
+      arrowW,
+      bh,
+      '>',
+      storagePage < pageCount - 1,
+      [140, 230, 255]
+    );
+    fill(150, 200, 225, 180);
+    textAlign(CENTER, CENTER);
+    textSize(Math.max(9, s * 0.55));
+    text(
+      `${storagePage + 1}/${pageCount}`,
+      prevX - 12,
+      by + bh / 2 + 1
+    );
+  }
+}
+
+function drawStorageDetail(
+  o,
+  contentX,
+  contentY,
+  contentW,
+  contentH,
+  footerY,
+  footerH,
+  s
+) {
+  const wide = width > 600;
+  const color = COLONY_COLORS[teamColorIndex] || COLONY_COLORS[0];
+  const previewW = wide ? contentW * 0.4 : contentW;
+  const previewHArea = wide ? contentH : contentH * 0.48;
+  const previewH = Math.max(
+    50,
+    Math.min(wide ? 210 : 150, previewHArea - 28, previewW - 24)
+  );
+  const previewCx = contentX + previewW / 2;
+  const groundY = contentY + previewHArea - 14;
+
+  fill(240, 252, 255, 225);
+  textAlign(CENTER, TOP);
+  textSize(Math.max(12, s * 0.82));
+  text(`OTTO #${o.id}`, previewCx, contentY + 2);
+  drawOttoPreview(previewCx, groundY, previewH, color, storedAssetFor(o));
+
+  const rows = [
+    ['ATTACK', o.stats.attack],
+    ['SPEED', o.stats.speed.toFixed(1)],
+    ['SIZE', o.stats.size.toFixed(2)],
+    ['SIGHT', o.stats.sight],
+    ['AGGRESSION', o.stats.aggression],
+    ['HP', `${Math.max(0, Math.round(o.hp))}/${o.maxHp || MAX_HP}`],
+    ['ENERGY', Math.round(o.energy)],
+  ];
+
+  let statsX;
+  let statsY;
+  let statsW;
+  let rowH;
+  if (wide) {
+    statsX = contentX + previewW + 12;
+    statsY = contentY + 6;
+    statsW = contentW - previewW - 12;
+    rowH = Math.min(s * 2.7, (contentH - 20) / rows.length);
+  } else {
+    statsX = contentX;
+    statsY = contentY + previewHArea + 4;
+    statsW = contentW;
+    rowH = Math.min(
+      s * 2.1,
+      (contentH - previewHArea - 10) / rows.length
+    );
+  }
+
+  for (let i = 0; i < rows.length; i++) {
+    const cy = statsY + i * rowH + rowH / 2;
+    fill(170, 215, 235, 185);
+    textAlign(LEFT, CENTER);
+    textSize(Math.max(9, s * 0.58));
+    text(rows[i][0], statsX, cy);
+    fill(240, 252, 255, 230);
+    textAlign(RIGHT, CENTER);
+    textSize(Math.max(10, s * 0.64));
+    text(String(rows[i][1]), statsX + statsW, cy);
+  }
+
+  const by = footerY + 8;
+  const bh = footerH - 16;
+  const gap = 8;
+  const bw = (contentW - gap * 2) / 3;
+
+  storageBackHit = { x: contentX, y: by, w: bw, h: bh };
+  drawStoragePill(contentX, by, bw, bh, 'BACK', true, [140, 230, 255]);
 
   const windowOpen = placementWindowOpen();
   const canQueue = !windowOpen && allAutoSkip();
   const canPlace = windowOpen || canQueue;
-
-  const bw = Math.min(width - 60, 320);
-  const bh = 54;
-  const bx = width / 2 - bw / 2;
-
-  const placeY = height * 0.63;
-  storedPlaceHit = canPlace ? { x: bx, y: placeY, w: bw, h: bh } : null;
-  noFill();
-  stroke(
-    canPlace ? color(126, 255, 190, 170) : color(100, 120, 135, 90)
-  );
-  strokeWeight(1);
-  rect(bx, placeY, bw, bh, bh / 2);
-  noStroke();
-  fill(canPlace ? color(126, 255, 190, 230) : color(100, 120, 135, 150));
-  textSize(15);
-  text(
-    canPlace
-      ? canQueue
-        ? 'QUEUE STORED OTTO'
-        : 'PLACE STORED OTTO'
-      : 'WAIT FOR PAUSE',
-    width / 2,
-    placeY + bh / 2 + 1
+  const placeLabel = windowOpen
+    ? 'PLACE OTTO'
+    : canQueue
+    ? 'QUEUE OTTO'
+    : 'WAIT FOR PAUSE';
+  storagePlaceHit = canPlace
+    ? { x: contentX + bw + gap, y: by, w: bw, h: bh }
+    : null;
+  drawStoragePill(
+    contentX + bw + gap,
+    by,
+    bw,
+    bh,
+    placeLabel,
+    canPlace,
+    [126, 255, 190]
   );
 
-  const scratchY = height * 0.72;
-  scratchHit = { x: bx, y: scratchY, w: bw, h: bh };
-  noFill();
-  stroke(255, 200, 110, 150);
-  strokeWeight(1);
-  rect(bx, scratchY, bw, bh, bh / 2);
-  noStroke();
-  fill(255, 220, 150, 230);
-  text('START FROM SCRATCH', width / 2, scratchY + bh / 2 + 1);
-  pop();
+  storageDiscardHit = {
+    x: contentX + (bw + gap) * 2,
+    y: by,
+    w: bw,
+    h: bh,
+  };
+  drawStoragePill(
+    storageDiscardHit.x,
+    by,
+    bw,
+    bh,
+    storageDiscardArmed ? 'DISCARD?' : 'DISCARD',
+    true,
+    [255, 150, 120]
+  );
+}
+
+function handleStoragePress() {
+  if (hitRect(storageCloseHit, mouseX, mouseY)) {
+    closeStorage();
+    return;
+  }
+
+  const selected = getStoredOtto(storageSelectedId);
+  if (selected) {
+    if (hitRect(storageBackHit, mouseX, mouseY)) {
+      storageSelectedId = null;
+      storageDiscardArmed = false;
+      return;
+    }
+    if (hitRect(storagePlaceHit, mouseX, mouseY)) {
+      storageOpen = false;
+      storageSelectedId = selected.id;
+      storageDiscardArmed = false;
+      pendingStoredId = selected.id;
+      allocationActive = false;
+      placementActive = true;
+      placementQueued = false;
+      queuedPlacement = null;
+      placementMode = 'stored';
+      return;
+    }
+    if (hitRect(storageDiscardHit, mouseX, mouseY)) {
+      if (!storageDiscardArmed) {
+        storageDiscardArmed = true;
+      } else {
+        removeStoredOtto(selected.id);
+        storageSelectedId = null;
+        storageDiscardArmed = false;
+      }
+      return;
+    }
+    return;
+  }
+
+  if (hitRect(storageNewHit, mouseX, mouseY)) {
+    closeStorage();
+    startFromScratch();
+    return;
+  }
+  if (hitRect(storagePrevHit, mouseX, mouseY)) {
+    storagePage = Math.max(0, storagePage - 1);
+    return;
+  }
+  if (hitRect(storageNextHit, mouseX, mouseY)) {
+    storagePage += 1;
+    return;
+  }
+
+  for (const hit of storageHits) {
+    if (hitRect(hit, mouseX, mouseY)) {
+      storageSelectedId = hit.id;
+      storageDiscardArmed = false;
+      return;
+    }
+  }
 }
 
 function drawLobbyOverlays() {
-  storedPlaceHit = null;
-  scratchHit = null;
   placementCancelHit = null;
   if (!shareConnected) {
     drawConnectionScreen();
     return;
   }
-  if (lobbyChoiceActive && storedOtto) drawStoredChoiceScreen();
+  if (storageOpen) drawStoragePanel();
   else if (allocationActive) drawAllocationScreen();
   else if (placementActive) drawPlacementPrompt();
   else if (placementQueued) drawQueuedPlacementPrompt();
@@ -3947,37 +4384,22 @@ function drawHud() {
     }
   }
 
-  // Stored Otto indicator. Placement is allowed while paused; with auto-skip
-  // everywhere, the player can queue a stored placement instead.
-  if (storedOtto && !panel.open) {
+  // Storage button. This opens the reserve; placement rules are handled inside.
+  storageHit = null;
+  if (!panel.open && !placementActive && !placementQueued && !storageOpen) {
     const dy = chipY + chipH + 8;
-    const canQueueStored = !paused && allAutoSkip();
-    const storageLabel = paused
-      ? 'PLACE STORED'
-      : canQueueStored
-      ? 'QUEUE STORED'
-      : 'STORED · PAUSE';
+    const count = storedOttos.length;
+    const storageLabel = count ? `STORAGE · ${count}` : 'STORAGE';
     textSize(s * 0.58);
     const sw = textWidth(storageLabel) + 22;
-    const storageActive = paused || canQueueStored;
-    storageHit = storageActive
-      ? { x: 18, y: dy, w: sw, h: chipH }
-      : null;
+    storageHit = { x: 18, y: dy, w: sw, h: chipH };
 
     noFill();
-    stroke(
-      storageActive
-        ? color(126, 255, 190, 170)
-        : color(255, 200, 110, 120)
-    );
+    stroke(count ? color(126, 255, 190, 170) : color(140, 230, 255, 85));
     strokeWeight(1);
     rect(18, dy, sw, chipH, chipH / 2);
     noStroke();
-    fill(
-      storageActive
-        ? color(126, 255, 190, 230)
-        : color(255, 220, 150, 200)
-    );
+    fill(count ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
     textAlign(CENTER, CENTER);
     text(storageLabel, 18 + sw / 2, dy + chipH / 2 + 1);
   }
@@ -3989,7 +4411,7 @@ function drawHud() {
     !placementActive &&
     !placementQueued &&
     !allocationActive &&
-    !lobbyChoiceActive
+    !storageOpen
   ) {
     textAlign(CENTER, BOTTOM);
     fill(205, 232, 245, 180);
@@ -4168,23 +4590,14 @@ function mousePressed() {
     return false;
   }
 
-  // The pause vote stays available even over the lobby/fail screens.
-  if (paused && hitRect(yesHit, mouseX, mouseY)) {
-    castLocalYes();
+  if (storageOpen) {
+    handleStoragePress();
     return false;
   }
 
-  if (lobbyChoiceActive && storedOtto) {
-    if (hitRect(storedPlaceHit, mouseX, mouseY)) {
-      lobbyChoiceActive = false;
-      allocationActive = false;
-      placementActive = true;
-      placementQueued = false;
-      queuedPlacement = null;
-      placementMode = 'stored';
-    } else if (hitRect(scratchHit, mouseX, mouseY)) {
-      startFromScratch();
-    }
+  // The pause vote stays available even over the lobby/fail screens.
+  if (paused && hitRect(yesHit, mouseX, mouseY)) {
+    castLocalYes();
     return false;
   }
 
@@ -4221,16 +4634,20 @@ function mousePressed() {
     if (field.ok && fieldLock > 0.05) {
       const tap = screenToField(mouseX, mouseY);
       if (!tap) return false;
+      const stored =
+        placementMode === 'stored' ? getStoredOtto(pendingStoredId) : null;
+      if (placementMode === 'stored' && !stored) {
+        placementActive = false;
+        return false;
+      }
       const spot = clampToField(
         tap.x,
         tap.y,
         Math.max(
           0.8,
           1.5 *
-            (placementMode === 'stored'
-              ? storedOtto
-                ? storedOtto.stats.size
-                : 1
+            (stored
+              ? stored.stats.size
               : pendingStats
               ? pendingStats.size
               : 1)
@@ -4243,6 +4660,7 @@ function mousePressed() {
           x: spot.x,
           y: spot.y,
           mode: placementMode,
+          storedId: stored ? stored.id : null,
         };
         placementQueued = true;
         placementActive = false;
@@ -4263,15 +4681,8 @@ function mousePressed() {
     return false;
   }
 
-  if (storedOtto && hitRect(storageHit, mouseX, mouseY)) {
-    if (paused || allAutoSkip()) {
-      lobbyChoiceActive = false;
-      allocationActive = false;
-      placementActive = true;
-      placementQueued = false;
-      queuedPlacement = null;
-      placementMode = 'stored';
-    }
+  if (hitRect(storageHit, mouseX, mouseY)) {
+    openStorage();
     return false;
   }
 
@@ -4450,7 +4861,7 @@ function togglePageFullscreen() {
 function drawFullscreenButton() {
   fullscreenHit = null;
   if (
-    lobbyChoiceActive ||
+    storageOpen ||
     placementActive ||
     placementQueued ||
     panel.open ||
