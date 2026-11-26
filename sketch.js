@@ -591,19 +591,29 @@ function defaultStats() {
   };
 }
 
+function allocationStepFor(key) {
+  return key === 'speed' || key === 'size' ? 0.1 : 1;
+}
+
 function statsFromAllocation(points) {
   const base = defaultStats();
-  return {
-    attack: base.attack + points.attack,
-    speed: base.speed + points.speed * 0.1,
-    size: base.size + points.size * 0.1,
-    sight: base.sight + points.sight,
-    aggression: base.aggression + points.aggression,
+  const stats = {
+    attack: base.attack + points.attack * allocationStepFor('attack'),
+    speed: base.speed + points.speed * allocationStepFor('speed'),
+    size: base.size + points.size * allocationStepFor('size'),
+    sight: base.sight + points.sight * allocationStepFor('sight'),
+    aggression:
+      base.aggression + points.aggression * allocationStepFor('aggression'),
   };
+  for (const key of STAT_KEYS) {
+    const def = STAT_DEFS[key];
+    stats[key] = constrain(stats[key], def.min, def.max);
+  }
+  return stats;
 }
 
 function maxHpFromAllocation(points) {
-  return MAX_HP + points.hp * 10;
+  return Math.max(50, MAX_HP + points.hp * 10);
 }
 
 // Daily energy cost is a pure function of Size, so it cannot be edited or
@@ -2888,13 +2898,26 @@ function startFromScratch() {
   resetAllocation();
 }
 
+function allocationAtMax(key) {
+  if (key === 'hp') return false;
+  const def = STAT_DEFS[key];
+  if (!def) return false;
+  const base = defaultStats()[key];
+  return (
+    base + allocationPoints[key] * allocationStepFor(key) >=
+    def.max - 1e-6
+  );
+}
+
 function adjustAllocation(key, dir) {
   if (dir < 0) {
-    if (allocationPoints[key] <= 0) return;
+    // Up to five steps below the base stat, each worth one extra point.
+    if (allocationPoints[key] <= -5) return;
     allocationPoints[key] -= 1;
     allocationRemaining += 1;
   } else {
     if (allocationRemaining <= 0) return;
+    if (allocationAtMax(key)) return;
     allocationPoints[key] += 1;
     allocationRemaining -= 1;
   }
@@ -2976,9 +2999,42 @@ function drawAllocationScreen() {
   textAlign(LEFT, TOP);
   textSize(Math.max(15, s * 1.1));
   text('CREATE YOUR OTTO', panelX + pad, panelY + 12);
-  fill(126, 255, 190, 220);
-  textSize(Math.max(11, s * 0.78));
-  text(`${allocationRemaining} POINTS LEFT`, panelX + pad, panelY + 12 + s * 1.5);
+
+  // Points-remaining box.
+  const pointBoxW = Math.min(164, panelW * 0.36);
+  const pointBoxH = Math.max(40, s * 2.5);
+  const pointBoxX = panelX + panelW - pointBoxW - pad;
+  const pointBoxY = panelY + 10;
+  fill(255, 255, 255, 16);
+  rect(pointBoxX, pointBoxY, pointBoxW, pointBoxH, 8);
+  noFill();
+  stroke(
+    allocationRemaining === 0
+      ? color(126, 255, 190, 180)
+      : color(140, 230, 255, 110)
+  );
+  strokeWeight(1);
+  rect(pointBoxX, pointBoxY, pointBoxW, pointBoxH, 8);
+  noStroke();
+  textAlign(CENTER, TOP);
+  fill(150, 205, 230, 190);
+  textSize(Math.max(8, s * 0.46));
+  text(
+    'POINTS REMAINING',
+    pointBoxX + pointBoxW / 2,
+    pointBoxY + 5
+  );
+  fill(
+    allocationRemaining === 0
+      ? color(126, 255, 190, 235)
+      : color(240, 252, 255, 235)
+  );
+  textSize(Math.max(15, s * 1.35));
+  text(
+    String(allocationRemaining),
+    pointBoxX + pointBoxW / 2,
+    pointBoxY + pointBoxH * 0.36
+  );
 
   // Left column: preview + colour picker, centred vertically beside the stats.
   const cols = 5;
@@ -3045,7 +3101,7 @@ function drawAllocationScreen() {
   // Right column: stat rows.
   const keys = ['attack', 'speed', 'size', 'sight', 'aggression', 'hp'];
   const labels = ['ATTACK', 'SPEED', 'SIZE', 'SIGHT', 'AGGRESSION', 'HP'];
-  const base = defaultStats();
+  const stats = statsFromAllocation(allocationPoints);
   const rowH = Math.min(s * 4.6, (contentH - 20) / 6);
   const rowsY = contentY + (contentH - rowH * 6) / 2;
 
@@ -3055,15 +3111,17 @@ function drawAllocationScreen() {
     const y = rowsY + i * rowH;
     const cy = y + rowH / 2;
     let value;
-    if (key === 'hp') value = `${MAX_HP + points * 10}`;
-    else if (key === 'speed') value = (base.speed + points * 0.1).toFixed(1);
-    else if (key === 'size') value = (base.size + points * 0.1).toFixed(2);
-    else value = String(base[key] + points);
+    if (key === 'hp') value = String(maxHpFromAllocation(allocationPoints));
+    else if (key === 'speed') value = stats.speed.toFixed(1);
+    else if (key === 'size') value = stats.size.toFixed(2);
+    else value = String(stats[key]);
 
     fill(170, 215, 235, 190);
     textAlign(LEFT, CENTER);
     textSize(Math.max(9, s * 0.6));
-    text(points > 0 ? `${labels[i]} +${points}` : labels[i], rightX, cy);
+    const delta =
+      points > 0 ? ` +${points}` : points < 0 ? ` ${points}` : '';
+    text(labels[i] + delta, rightX, cy);
 
     fill(240, 252, 255, 230);
     textAlign(RIGHT, CENTER);
@@ -3080,7 +3138,10 @@ function drawAllocationScreen() {
       [minusX, '−', -1],
       [plusX, '+', 1],
     ]) {
-      const active = dir < 0 ? points > 0 : allocationRemaining > 0;
+      const active =
+        dir < 0
+          ? points > -5
+          : allocationRemaining > 0 && !allocationAtMax(key);
       noFill();
       stroke(active ? color(140, 230, 255, 120) : color(80, 100, 115, 80));
       strokeWeight(1);
@@ -3127,7 +3188,7 @@ function drawAllocationScreen() {
   textAlign(CENTER, CENTER);
   textSize(Math.max(11, s * 0.82));
   const confirmLabel = !ready
-    ? 'SPEND ALL 10 POINTS'
+    ? `SPEND ${allocationRemaining} POINTS`
     : windowOpen
     ? 'CONFIRM & PLACE'
     : canQueue
