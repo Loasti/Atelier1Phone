@@ -37,7 +37,7 @@ const FRIEND_STEER = 0.9; // how strongly friends bend the path
 
 // Food and time.
 const FOOD_AMOUNT = 25;
-const FOOD_PER_COLONY = 10; // fresh pieces per living colony each day
+const FOOD_PER_COLONY = 15; // fresh pieces per living colony each day
 const FOOD_RADIUS = 0.45;
 const HEAL_FRACTION = 0.25; // fraction of max HP restored by eating
 
