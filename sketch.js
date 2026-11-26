@@ -324,6 +324,15 @@ function hasLivingOtto(list) {
   );
 }
 
+function localCombatId(o) {
+  return window.shareClientId ? window.shareClientId + '#' + o.id : null;
+}
+
+function isHuntingMe(r, o) {
+  const id = localCombatId(o);
+  return !!(id && r && r.mode === 'hunt' && r.targetId === id);
+}
+
 // Only phones with a living colony take part in the day clock and pause vote.
 // Empty tabs, inspectors, and phones still in creation must not block the room.
 function playerIds() {
@@ -1749,52 +1758,74 @@ function chooseIntent(o) {
   const st = o.stats;
   const need = energyRequirementFor(st.size);
 
-  // Nearest other Otto inside the sight radius.
+  // Nearest other Otto inside the sight radius, plus the nearest one that is
+  // specifically hunting this Otto.
   let enemy = null;
   let enemyD = Infinity;
+  let threat = null;
+  let threatD = Infinity;
+  const myId = localCombatId(o);
   for (const r of remote.values()) {
     if (r.hp <= 0) continue;
+    const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
+    if (
+      myId &&
+      r.mode === 'hunt' &&
+      r.targetId === myId &&
+      d <= st.sight + r.size * 0.6 &&
+      d < threatD
+    ) {
+      threat = r;
+      threatD = d;
+    }
     if (
       o.chaseIgnoreId === r.id &&
       simClock < o.chaseIgnoreUntil
     ) {
       continue;
     }
-    const d = Math.hypot(r.x - o.pos.x, r.y - o.pos.y);
     if (d <= st.sight + r.size * 0.6 && d < enemyD) {
       enemy = r;
       enemyD = d;
     }
   }
 
-  // Commit to fleeing for a minimum time, and keep going while the threat is
-  // still inside 1.5× sight. This prevents flee/return thrashing at the edge.
+  // Commit to fleeing for a minimum time, and keep going while the hunter is
+  // still inside 1.5× sight. A target that stops hunting this Otto is not a
+  // threat anymore, so the flee state clears immediately.
   if (o.mode === 'flee' && o.fleeThreat) {
-    const threatAlive = remote.has(o.fleeThreat.id) && o.fleeThreat.hp > 0;
+    const threatAlive =
+      remote.has(o.fleeThreat.id) &&
+      o.fleeThreat.hp > 0 &&
+      isHuntingMe(o.fleeThreat, o);
+
     if (threatAlive) {
       o.threatX = o.fleeThreat.x;
       o.threatY = o.fleeThreat.y;
       o.threatAt = simClock;
-    }
 
-    const dThreat =
-      o.threatX == null || o.threatY == null
-        ? Infinity
-        : Math.hypot(o.threatX - o.pos.x, o.threatY - o.pos.y);
-    const stillClose = dThreat < st.sight * FLEE_SAFE_MULT;
+      const dThreat =
+        o.threatX == null || o.threatY == null
+          ? Infinity
+          : Math.hypot(o.threatX - o.pos.x, o.threatY - o.pos.y);
+      const stillClose = dThreat < st.sight * FLEE_SAFE_MULT;
 
-    if (simClock < o.fleeUntil || stillClose) {
-      o.mode = 'flee';
-      o.target = {
-        x: o.threatX == null ? o.pos.x : o.threatX,
-        y: o.threatY == null ? o.pos.y : o.threatY,
-        foe: threatAlive ? o.fleeThreat : null,
-      };
-      return;
+      if (simClock < o.fleeUntil || stillClose) {
+        o.mode = 'flee';
+        o.target = {
+          x: o.threatX == null ? o.pos.x : o.threatX,
+          y: o.threatY == null ? o.pos.y : o.threatY,
+          foe: o.fleeThreat,
+        };
+        return;
+      }
     }
 
     o.fleeThreat = null;
     o.fleeUntil = 0;
+    o.threatX = null;
+    o.threatY = null;
+    o.threatAt = 0;
   }
 
   // Food: prefer pieces away from the last known threat position.
@@ -1829,20 +1860,20 @@ function chooseIntent(o) {
     foodD = safeFoodD;
   }
 
-  // Aggression against the other Otto's Size decides fight or flight.
-  const scared = enemy && st.aggression < enemy.size * 10;
+  // Aggression against the hunter's Size decides fight or flight.
+  const scared = threat && st.aggression < threat.size * 10;
   const hungry = o.energy < need;
   const needsHeal = o.hp < (o.maxHp || MAX_HP);
   const wantsSurplus = o.energy < need * ENERGY_STORE_MULT;
 
   if (scared) {
     o.mode = 'flee';
-    o.fleeThreat = enemy;
+    o.fleeThreat = threat;
     o.fleeUntil = simClock + FLEE_MIN_TIME;
-    o.threatX = enemy.x;
-    o.threatY = enemy.y;
+    o.threatX = threat.x;
+    o.threatY = threat.y;
     o.threatAt = simClock;
-    o.target = { x: enemy.x, y: enemy.y, foe: enemy };
+    o.target = { x: threat.x, y: threat.y, foe: threat };
     return;
   }
 
@@ -1969,6 +2000,38 @@ function updateChase(o, dt) {
   }
 }
 
+// Pick an escape direction that still has room inside the taped square. If the
+// direct route away from the threat points into a wall or corner, rotate it
+// along the wall instead of pressing the Otto into the boundary.
+function chooseFleeDirection(o, awayX, awayY) {
+  const awayLen = Math.hypot(awayX, awayY);
+  if (awayLen < 0.001) {
+    const d = Math.hypot(o.pos.x, o.pos.y);
+    if (d > 0.001) return { x: -o.pos.x / d, y: -o.pos.y / d };
+    return { x: 0, y: 0 };
+  }
+  awayX /= awayLen;
+  awayY /= awayLen;
+
+  // If the direct escape route still has room, use it.
+  const lookAhead = 4.0;
+  const inner = FIELD_HALF - 0.8;
+  const px = o.pos.x + awayX * lookAhead;
+  const py = o.pos.y + awayY * lookAhead;
+  if (Math.abs(px) <= inner && Math.abs(py) <= inner) {
+    return { x: awayX, y: awayY };
+  }
+
+  // The direct route hits a wall or corner. Rotate onto the tangent and let
+  // the field clamp slide the Otto along the boundary. Keeping the turn
+  // direction fixed per Otto prevents left/right oscillation in corners.
+  const turn = o.id % 2 ? 1 : -1;
+  return {
+    x: turn * awayY,
+    y: -turn * awayX,
+  };
+}
+
 function moveOtto(o, dt) {
   const st = o.stats;
   const t = o.target;
@@ -1982,9 +2045,9 @@ function moveOtto(o, dt) {
   if (o.mode === 'flee') {
     const dx = o.pos.x - t.x;
     const dy = o.pos.y - t.y;
-    const d = Math.hypot(dx, dy) || 1;
-    tx = o.pos.x + (dx / d) * FLEE_RANGE;
-    ty = o.pos.y + (dy / d) * FLEE_RANGE;
+    const dir = chooseFleeDirection(o, dx, dy);
+    tx = o.pos.x + dir.x * FLEE_RANGE;
+    ty = o.pos.y + dir.y * FLEE_RANGE;
     speed *= 1.2;
   } else if (o.mode === 'wander') {
     speed *= 0.45;
@@ -2068,7 +2131,8 @@ function receiveIncomingAttack(o) {
     return;
   }
 
-  const myId = window.shareClientId + '#' + o.id;
+  const myId = localCombatId(o);
+  if (!myId) return;
   let attacker = null;
   let best = Infinity;
 
