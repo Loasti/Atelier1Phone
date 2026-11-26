@@ -36,9 +36,8 @@ const FRIEND_SPACE = 0.8; // personal-space radius per combined half-width
 const FRIEND_STEER = 0.9; // how strongly friends bend the path
 
 // Food and time.
-const FOOD_AMOUNT = 10;
-const FOOD_MAX = 30;
-const FOOD_PER_DAY = 30;
+const FOOD_AMOUNT = 25;
+const FOOD_PER_COLONY = 10; // fresh pieces per living colony each day
 const FOOD_RADIUS = 0.45;
 const HEAL_FRACTION = 0.25; // fraction of max HP restored by eating
 
@@ -116,15 +115,13 @@ let wasPausedForClock = false;
 let lastMillis = 0;
 let scanTick = 0;
 let joinHit = null;
-let tuneHit = null;
 let fullscreenHit = null;
-let pauseHit = null;
 let yesHit = null;
 let autoHit = null;
 let autoSkipDay = false;
 let timeHit = null;
-let timeScale = 1; // 1×, 10× or 100× for testing
-let panel = { open: false, rows: [], drag: null, fieldHit: null };
+let timeScale = 1; // 1× or 5× for testing
+let panel = { open: false, rows: [], drag: null };
 
 // Pause state. Solo toggles locally; multiplayer waits for every connected
 // phone to tap YES at the start of a new day.
@@ -384,8 +381,11 @@ function isDayLeader() {
 function updateSharedDayClock(dt) {
   if (!shareConnected) return;
 
-  const scale =
-    typeof shared.timeScale === 'number' ? shared.timeScale : 1;
+  // Normalize old shared rooms that still carry 10x or 100x.
+  if (shared.timeScale !== 1 && shared.timeScale !== 5) {
+    shared.timeScale = 1;
+  }
+  const scale = shared.timeScale;
   const leader = isDayLeader();
   const now = millis() / 1000;
   const sharedPaused = !!(shared.pause && shared.pause.active);
@@ -1015,7 +1015,7 @@ function draw() {
 
   if (!paused) {
     // Full-simulation speed boost. Substepping keeps movement and collisions
-    // stable when the day clock is running at 10× or 100×.
+    // stable when the day clock is running at 5×.
     const activeTimeScale = shareConnected && typeof shared.timeScale === 'number'
       ? shared.timeScale
       : timeScale;
@@ -2107,16 +2107,17 @@ function updateFood(dt) {
   // room's food layout.
   if (!isDayLeader()) return;
   if (shared.foodSeedDay === shared.day) return;
+  const colonies = playerIds().length;
+  if (colonies === 0) return;
   const fresh = {};
-  seedFood(fresh, FOOD_PER_DAY);
+  seedFood(fresh, FOOD_PER_COLONY * colonies);
   shared.food = fresh;
   shared.foodSeedDay = shared.day;
 }
 
 function seedFood(store, howMany) {
-  let count = Object.keys(store).length;
   const half = Math.max(1, FIELD_HALF - FOOD_RADIUS - 0.8);
-  for (let i = 0; i < howMany && count < FOOD_MAX; i++, count++) {
+  for (let i = 0; i < howMany; i++) {
     store['f' + Math.floor(Math.random() * 1e9)] = {
       x: Math.round((Math.random() * 2 - 1) * half * 100) / 100,
       y: Math.round((Math.random() * 2 - 1) * half * 100) / 100,
@@ -3756,10 +3757,6 @@ function drawHud() {
     const logoW = textWidth('OTTO BOX');
     image(logoImg, 18 + logoW + 8, 15, s * 1.15, s * 1.15);
   }
-  fill(120, 220, 255, 150);
-  textSize(s * 0.72);
-  text('GREEN TAPE FIELD', 18, 16 + s * 1.55);
-
   // Room state.
   let roomText = 'CONNECTING TO SHARED SPACE...';
   let roomTone = [150, 200, 220];
@@ -3812,7 +3809,6 @@ function drawHud() {
   );
 
   // HUD controls, kept clear of the desktop QR in the top-right corner.
-  pauseHit = null;
   autoHit = null;
   timeHit = null;
   devHit = null;
@@ -3821,28 +3817,15 @@ function drawHud() {
   const rowH = s * 1.9;
   const rowY = 16 + s * 4.85;
 
-  const chipW = s * 4.4;
   const chipH = rowH;
-  const chipX = 18;
   const chipY = rowY;
-  tuneHit = { x: chipX, y: chipY, w: chipW, h: chipH };
-
-  noFill();
-  stroke(showField ? color(126, 255, 190, 170) : color(140, 230, 255, 85));
-  strokeWeight(1);
-  rect(chipX, chipY, chipW, chipH, chipH / 2);
-  noStroke();
-  fill(showField ? color(126, 255, 190, 230) : color(150, 235, 255, 200));
-  textAlign(CENTER, CENTER);
-  textSize(s * 0.58);
-  text('FIELD', chipX + chipW / 2, chipY + chipH / 2 + 1);
 
   // Auto-skip the day-end confirmation for this player.
   if (!panel.open) {
-    const autoLabel = autoSkipDay ? 'AUTO ON' : 'AUTO OFF';
+    const autoLabel = 'AUTO SKIP';
     textSize(s * 0.58);
     const aw = textWidth(autoLabel) + 22;
-    const ax = (pauseHit ? pauseHit.x + pauseHit.w : chipX + chipW) + 12;
+    const ax = 18;
     const ay = chipY;
     autoHit = { x: ax, y: ay, w: aw, h: chipH };
 
@@ -3865,7 +3848,7 @@ function drawHud() {
     const timeLabel = `${shownScale}×`;
     textSize(s * 0.58);
     const tw = textWidth(timeLabel) + 22;
-    const tx = (autoHit ? autoHit.x + autoHit.w : chipX + chipW) + 12;
+    const tx = (autoHit ? autoHit.x + autoHit.w : 18) + 12;
     const ty = chipY;
     timeHit = { x: tx, y: ty, w: tw, h: chipH };
 
@@ -3984,7 +3967,6 @@ function layoutPanel() {
   panel.rowH = rowH;
   panel.headH = headH;
   panel.footH = footH;
-  panel.fieldHit = { x: x + w - 78, y: y + 7, w: 66, h: headH - 14 };
 
   const trackX = x + 98;
   const trackW = w - 98 - 56;
@@ -4015,17 +3997,6 @@ function drawPanel() {
   fill(150, 225, 250, 220);
   textSize(s * 0.8);
   text('STATS', panel.x + 14, panel.y + panel.headH / 2);
-
-  const fh = panel.fieldHit;
-  noFill();
-  stroke(showField ? color(126, 255, 190, 190) : color(90, 120, 140, 150));
-  strokeWeight(1);
-  rect(fh.x, fh.y, fh.w, fh.h, fh.h / 2);
-  noStroke();
-  fill(showField ? color(126, 255, 190, 230) : color(140, 175, 195, 190));
-  textAlign(CENTER, CENTER);
-  textSize(s * 0.58);
-  text('FIELD', fh.x + fh.w / 2, fh.y + fh.h / 2 + 1);
 
   for (const row of panel.rows) {
     const cy = row.y + panel.rowH / 2;
@@ -4279,14 +4250,8 @@ function mousePressed() {
       return false;
     }
     if (panelContains(mouseX, mouseY)) {
-      if (hitRect(panel.fieldHit, mouseX, mouseY)) showField = !showField;
       return false;
     }
-  }
-
-  if (hitRect(tuneHit, mouseX, mouseY)) {
-    showField = !showField;
-    return false;
   }
 
   if (hitRect(timeHit, mouseX, mouseY)) {
@@ -4294,7 +4259,7 @@ function mousePressed() {
       shareConnected && typeof shared.timeScale === 'number'
         ? shared.timeScale
         : timeScale;
-    const next = current === 1 ? 10 : current === 10 ? 100 : 1;
+    const next = current === 1 ? 5 : 1;
     timeScale = next;
     if (shareConnected) shared.timeScale = next;
     return false;
@@ -4361,10 +4326,8 @@ function fitCanvasToViewport() {
 
 function resetUiHits() {
   joinHit = null;
-  tuneHit = null;
   fullscreenHit = null;
   placementCancelHit = null;
-  pauseHit = null;
   yesHit = null;
   autoHit = null;
   timeHit = null;
