@@ -1,4 +1,4 @@
-# Otto Field — p5 Phone
+# Otto Box - p5 Phone
 
 A phone augmented-reality sketch. Point the rear camera at a tabletop, show it a green object, and an Otto anchors itself above the object. The creature is drawn with the `Otto1.gif` sprite, and a join button connects several phones to the same shared room.
 
@@ -29,7 +29,7 @@ https://YOUR-USERNAME.github.io/YOUR-REPO-NAME/
 
 ## What is in the sketch
 
-**Otto Field** opens the rear camera and looks for the largest green blob in the frame:
+**Otto Box** opens the rear camera and looks for the taped green square in the frame:
 
 - Each frame is downsampled to a 160 × 90 buffer. Pixels where green clearly dominates red and blue are marked, and a flood fill finds the biggest connected blob. Wood, skin, white paper and grey tabletops fall out; a green object does not.
 - The blob's centre and apparent size are smoothed, then mapped back into camera screen space. The Otto's size follows the marker's screen size, so walking closer to the object makes the creature grow, like a real object at that distance.

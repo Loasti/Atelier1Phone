@@ -1,4 +1,4 @@
-// Otto Field
+// Otto Box
 // An AR window into a floor/tabletop world. Point the rear camera at a square
 // made of green tape: its four corners define the play area in perspective.
 // Food and other players' Ottos live inside that taped square, and this Otto
@@ -100,6 +100,7 @@ let marker;
 let ottos = [];
 let nextOttoId = 1;
 let ottoAssets = []; // { gif, layer, fills } for each sprite asset
+let logoImg = null;
 let field;
 let remote = new Map();
 let localFood = {};
@@ -227,12 +228,18 @@ async function setup() {
     }
   }
 
+  try {
+    logoImg = await loadImage('OttoBoxLOGO.png');
+  } catch (e) {
+    console.warn('Could not load OttoBoxLOGO.png', e);
+  }
+
   resetTracking();
   loadStoredOtto();
   lastMillis = millis() / 1000;
 
   cam = createPhoneCamera('environment', false, 'cover');
-  enableCameraTap('TAP TO ENTER THE OTTO FIELD');
+  enableCameraTap('TAP TO ENTER OTTO BOX');
   showDesktopQr({ label: 'Scan to open on your phone' });
 
   // Solo mode is gone; join the shared room automatically.
@@ -2895,18 +2902,26 @@ function drawLobbyOverlays() {
 function drawWaiting(now) {
   background(5, 8, 12);
 
+  const titleY = height * 0.52;
+  const logoSize = constrain(min(width, height) * 0.22, 80, 160);
+  if (logoImg) {
+    imageMode(CENTER);
+    image(logoImg, width / 2, titleY - logoSize * 0.72, logoSize, logoSize);
+    imageMode(CORNER);
+  }
+
   noStroke();
   fill(235, 250, 255, 230);
   textAlign(CENTER, CENTER);
   textSize(constrain(width * 0.075, 22, 44));
-  text('OTTO FIELD', width / 2, height * 0.44);
+  text('OTTO BOX', width / 2, titleY);
 
   fill(130, 200, 225, 200);
   textSize(constrain(width * 0.034, 11, 16));
   text(
     window.cameraEnabled ? 'STARTING CAMERA...' : 'TAP TO START',
     width / 2,
-    height * 0.44 + min(width, height) * 0.1
+    titleY + min(width, height) * 0.1
   );
 }
 
@@ -3487,7 +3502,11 @@ function drawHud() {
   textAlign(LEFT, TOP);
   fill(240, 252, 255, 235);
   textSize(s * 1.15);
-  text('OTTO FIELD', 18, 16);
+  text('OTTO BOX', 18, 16);
+  if (logoImg) {
+    const logoW = textWidth('OTTO BOX');
+    image(logoImg, 18 + logoW + 8, 15, s * 1.15, s * 1.15);
+  }
   fill(120, 220, 255, 150);
   textSize(s * 0.72);
   text('GREEN TAPE FIELD', 18, 16 + s * 1.55);
